@@ -1,0 +1,29 @@
+[Unit]
+Description=Scoreboard Streamer (Pi Camera → YouTube Live via socket.io)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skuzmak
+WorkingDirectory=/home/skuzmak/projects/scoreboard
+# Stream command listener is required (refuses to start without it).
+# Flask control API is kept on :8080 for manual debugging.
+ExecStart=/usr/bin/python3 /home/skuzmak/projects/scoreboard/stream_scoreboard.py \
+    --id 6 \
+    --identifier TEST1 \
+    --api-port 8080 \
+    --url https://scoreboard.ubiconet.com
+Restart=on-failure
+RestartSec=5
+
+# Allow Python to find the command_listener.py sitting next to stream_scoreboard.py
+Environment=PYTHONPATH=/home/skuzmak/projects/scoreboard
+
+# Keep stdout/stderr in journald for debugging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=scoreboard-stream
+
+[Install]
+WantedBy=multi-user.target

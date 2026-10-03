@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scoreboard API — Client Integration Guide</title>
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --card: #16213e;
+      --text: #eaeaea;
+      --muted: #8a8aa3;
+      --border: #243358;
+      --accent: #e94560;
+      --green: #38b27a;
+      --code-bg: #0f1525;
+      --code-text: #c8d3f5;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 0.25rem;
+      color: var(--text);
+    }
+    h2 {
+      font-size: 1.3rem;
+      margin-top: 2.5rem;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    h3 {
+      font-size: 1.05rem;
+      margin-top: 1.5rem;
+      margin-bottom: 0.5rem;
+      color: var(--text);
+    }
+    p { margin-bottom: 0.75rem; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .subtitle { color: var(--muted); margin-bottom: 0.5rem; }
+    .badge {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      vertical-align: middle;
+    }
+    .badge-green { background: var(--green); }
+    .badge-yellow { background: #f0c040; color: #1a1a2e; }
+    .badge-red { background: #e94560; }
+    .badge-blue { background: #3b82f6; }
+    .toc {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.5rem;
+      margin: 1.5rem 0;
+    }
+    .toc ul { list-style: none; }
+    .toc li { padding: 0.2rem 0; }
+    .toc a { color: var(--text); }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      overflow-x: auto;
+      margin: 0.75rem 0 1rem;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    code {
+      font-family: 'SF Mono', Menlo, Consolas, monospace;
+    }
+    p code, li code, td code {
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 0.15rem 0.35rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+    }
+    pre code { background: none; padding: 0; color: var(--code-text); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0.75rem 0 1rem;
+      font-size: 0.9rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.5rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .endpoint {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin: 0.5rem 0;
+    }
+    .method {
+      display: inline-block;
+      font-family: monospace;
+      font-weight: 700;
+      font-size: 0.8rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      min-width: 60px;
+      text-align: center;
+    }
+    .method-get { background: #1a5c3a; color: #4ade80; }
+    .method-post { background: #1a3a5c; color: #60a5fa; }
+    .method-put { background: #5c4a1a; color: #fbbf24; }
+    .method-delete { background: #5c1a1a; color: #f87171; }
+    .method-ws { background: #3a1a5c; color: #c084fc; }
+    .path { font-family: monospace; font-size: 0.95rem; color: var(--text); }
+    hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+    .note {
+      background: rgba(59, 130, 246, 0.1);
+      border-left: 3px solid #3b82f6;
+      padding: 0.75rem 1rem;
+      border-radius: 0 8px 8px 0;
+      margin: 1rem 0;
+      font-size: 0.9rem;
+    }
+    .footer {
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-align: center;
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+
+<h1>Scoreboard API — Client Integration Guide</h1>
+<p class="subtitle">
+  Base URL (production): <code>https://scoreboard.ubiconet.com</code><br>
+  Backend (local dev): <code>http://localhost:4020</code>
+</p>
+<p class="subtitle">All REST endpoints accept and return JSON. CORS enabled for all origins.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li>1. <a href="#schemas">Data Schemas</a></li>
+    <li>2. <a href="#crud">REST API — Scoreboard CRUD</a></li>
+    <li>3. <a href="#state">REST API — State Updates</a></li>
+    <li>4. <a href="#display">REST API — Display Endpoint (Bandwidth-Optimized)</a></li>
+    <li>5. <a href="#websocket">WebSocket Events (Socket.io)</a></li>
+    <li>6. <a href="#validation">Validation Rules</a></li>
+    <li>7. <a href="#errors">Error Handling</a></li>
+  </ul>
+</div>
+
+<!-- ─────────── SCHEMAS ─────────── -->
+<h2 id="schemas">1. Data Schemas</h2>
+
+<h3>Scoreboard (full object — returned by CRUD endpoints)</h3>
+<pre><code>{
+  "id": 1,
+  "uniqueIdentifier": "field-1",
+  "displayName": "Memorial Field",
+  "homeTeamName": "Home",
+  "awayTeamName": "Away",
+  "homeScore": 3,
+  "awayScore": 2,
+  "inning": 5,
+  "half": "bottom",
+  "balls": 2,
+  "strikes": 1,
+  "outs": 1,
+  "gameId": null,
+  "stateVersion": 8,
+  "isActive": true,
+  "createdAt": "2026-07-14T20:00:00.000Z",
+  "updatedAt": "2026-07-14T21:30:00.000Z"
+}</code></pre>
+
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>id</code></td><td>number</td><td>Auto-increment primary key (read-only)</td></tr>
+    <tr><td><code>uniqueIdentifier</code></td><td>string</td><td>URL-safe slug <code>[a-zA-Z0-9_-]+</code>, max 100 chars. Used in display endpoint URL.</td></tr>
+    <tr><td><code>displayName</code></td><td>string</td><td>Human-friendly label. Defaults to <code>""</code>.</td></tr>
+    <tr><td><code>homeTeamName</code></td><td>string</td><td>Defaults to <code>"Home"</code>.</td></tr>
+    <tr><td><code>awayTeamName</code></td><td>string</td><td>Defaults to <code>"Away"</code>.</td></tr>
+    <tr><td><code>homeScore</code></td><td>number</td><td>Non-negative integer.</td></tr>
+    <tr><td><code>awayScore</code></td><td>number</td><td>Non-negative integer.</td></tr>
+    <tr><td><code>inning</code></td><td>number</td><td>Integer ≥ 1.</td></tr>
+    <tr><td><code>half</code></td><td><code>"top"</code> | <code>"bottom"</code></td><td>Which half of the inning.</td></tr>
+    <tr><td><code>balls</code></td><td>number</td><td>Integer 0–3.</td></tr>
+    <tr><td><code>strikes</code></td><td>number</td><td>Integer 0–2.</td></tr>
+    <tr><td><code>outs</code></td><td>number</td><td>Integer 0–2.</td></tr>
+    <tr><td><code>gameId</code></td><td>string | null</td><td>External game ID (for GameChanger integration). Nullable.</td></tr>
+    <tr><td><code>stateVersion</code></td><td>number</td><td>Auto-incremented on every state change. Used for ETag/304 caching. (read-only)</td></tr>
+    <tr><td><code>isActive</code></td><td>boolean</td><td>Defaults to <code>true</code>.</td></tr>
+    <tr><td><code>createdAt</code></td><td>string (ISO 8601)</td><td>Timestamp. (read-only)</td></tr>
+    <tr><td><code>updatedAt</code></td><td>string (ISO 8601)</td><td>Auto-updated via DB trigger. (read-only)</td></tr>
+  </tbody>
+</table>
+
+<h3>Display State (compact — display endpoint &amp; WebSocket push)</h3>
+<pre><code>{
+  "h": 3, "a": 2, "i": 5, "hf": "b", "b": 2, "s": 1, "o": 1, "v": 8
+}</code></pre>
+
+<table>
+  <thead><tr><th>Key</th><th>Maps to</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>h</code></td><td><code>homeScore</code></td><td></td></tr>
+    <tr><td><code>a</code></td><td><code>awayScore</code></td><td></td></tr>
+    <tr><td><code>i</code></td><td><code>inning</code></td><td></td></tr>
+    <tr><td><code>hf</code></td><td><code>half</code></td><td><code>"t"</code> = top, <code>"b"</code> = bottom</td></tr>
+    <tr><td><code>b</code></td><td><code>balls</code></td><td></td></tr>
+    <tr><td><code>s</code></td><td><code>strikes</code></td><td></td></tr>
+    <tr><td><code>o</code></td><td><code>outs</code></td><td></td></tr>
+    <tr><td><code>v</code></td><td><code>stateVersion</code></td><td></td></tr>
+  </tbody>
+</table>
+
+<!-- ─────────── CRUD ─────────── -->
+<h2 id="crud">2. REST API — Scoreboard CRUD</h2>
+
+<h3>Create Scoreboard</h3>
+<div class="endpoint">
+  <span class="method method-post">POST</span>
+  <span class="path">/api/scoreboards</span>
+</div>
+<p><strong>Request body</strong> (only <code>uniqueIdentifier</code> required):</p>
+<pre><code>{
+  "uniqueIdentifier": "field-1",
+  "displayName": "Memorial Field",
+  "homeTeamName": "Tigers",
+  "awayTeamName": "Eagles"
+}</code></pre>
+<p><strong>Response:</strong> <span class="badge badge-blue">201 Created</span></p>
+<pre><code>{ "scoreboard": { ... full Scoreboard object ... } }</code></pre>
+<p><strong>Errors:</strong> <span class="badge">400</span> missing/invalid identifier · <span class="badge badge-red">409</span> duplicate identifier</p>
+
+<h3>List Scoreboards</h3>
+<div class="endpoint">
+  <span class="method method-get">GET</span>
+  <span class="path">/api/scoreboards</span>
+</div>
+<p><strong>Response:</strong> <span class="badge badge-green">200 OK</span></p>
+<pre><code>{ "scoreboards": [ { ... }, { ... } ] }</code></pre>
+
+<h3>Get Single Scoreboard</h3>
+<div class="endpoint">
+  <span class="method method-get">GET</span>
+  <span class="path">/api/scoreboards/:id</span>
+</div>
+<p><strong>Path params:</strong> <code>id</code> — numeric scoreboard ID (e.g. <code>1</code>)</p>
+<p><strong>Response:</strong> <span class="badge badge-green">200 OK</span></p>
+<pre><code>{ "scoreboard": { ... full Scoreboard object ... } }</code></pre>
+<p><strong>Errors:</strong> <span class="badge badge-red">404</span> Not found</p>
+
+<h3>Update Metadata</h3>
+<div class="endpoint">
+  <span class="method method-put">PUT</span>
+  <span class="path">/api/scoreboards/:id</span>
+</div>
+<p>Updates: <code>uniqueIdentifier</code>, <code>displayName</code>, <code>homeTeamName</code>, <code>awayTeamName</code>, <code>gameId</code>.
+Merge-patch — only included fields are updated. Does <strong>not</strong> increment <code>stateVersion</code>.</p>
+<pre><code>{
+  "displayName": "Updated Name",
+  "homeTeamName": "Lions",
+  "gameId": "gc-12345"
+}</code></pre>
+<p>Send <code>"gameId": null</code> to clear it.</p>
+<p><strong>Response:</strong> <span class="badge badge-green">200 OK</span> → <code>{ "scoreboard": { ... } }</code></p>
+<p><strong>Errors:</strong> <span class="badge">400</span> validation · <span class="badge badge-red">404</span> not found · <span class="badge badge-red">409</span> duplicate identifier</p>
+
+<h3>Delete Scoreboard</h3>
+<div class="endpoint">
+  <span class="method method-delete">DELETE</span>
+  <span class="path">/api/scoreboards/:id</span>
+</div>
+<p><strong>Response:</strong> <span class="badge badge-green">200 OK</span></p>
+<pre><code>{ "deleted": true, "id": 1 }</code></pre>
+
+<!-- ─────────── STATE ─────────── -->
+<h2 id="state">3. REST API — State Updates</h2>
+
+<h3>Update State</h3>
+<div class="endpoint">
+  <span class="method method-put">PUT</span>
+  <span class="path">/api/scoreboards/:id/state</span>
+</div>
+<p>Updates: <code>homeScore</code>, <code>awayScore</code>, <code>inning</code>, <code>half</code>, <code>balls</code>, <code>strikes</code>, <code>outs</code>, <code>gameId</code>.
+Merge-patch semantics. <strong>Auto-increments <code>stateVersion</code>.</strong> Triggers WebSocket broadcast to all subscribed clients.</p>
+<pre><code>{
+  "homeScore": 5,
+  "awayScore": 3,
+  "inning": 6,
+  "half": "top",
+  "balls": 0,
+  "strikes": 0,
+  "outs": 1
+}</code></pre>
+<p><strong>Response:</strong> <span class="badge badge-green">200 OK</span> → <code>{ "scoreboard": { ... } }</code></p>
+<p><strong>Errors:</strong> <span class="badge">400</span> validation · <span class="badge badge-red">404</span> not found</p>
+
+<!-- ─────────── DISPLAY ─────────── -->
+<h2 id="display">4. REST API — Display Endpoint (Bandwidth-Optimized)</h2>
+
+<h3>Get Display State</h3>
+<div class="endpoint">
+  <span class="method method-get">GET</span>
+  <span class="path">/display/:identifier</span>
+</div>
+<p>Designed for electronic scoreboard hardware clients to poll. Returns the <strong>compact</strong> payload with single-letter keys. ETag/304 caching support for zero-byte responses when unchanged.</p>
+<p><strong>Path params:</strong> <code>identifier</code> — the scoreboard's <code>uniqueIdentifier</code> (e.g. <code>field-1</code>)</p>
+<p><strong>Response:</strong> <span class="badge badge-green">200 OK</span></p>
+<pre><code>{
+  "h": 3, "a": 2, "i": 5, "hf": "b", "b": 2, "s": 1, "o": 1, "v": 8
+}</code></pre>
+<p><strong>Headers:</strong> <code>ETag: "8"</code> · <code>Cache-Control: no-cache</code></p>
+
+<h3>ETag / 304 Caching</h3>
+<p>Send the <code>If-None-Match</code> header from the last response's <code>ETag</code>:</p>
+<pre><code>GET /display/field-1
+If-None-Match: "8"</code></pre>
+<p>If the state version hasn't changed, the server responds with:</p>
+<pre><code>HTTP/1.1 304 Not Modified</code></pre>
+<p>No response body — zero bytes of payload. Wildcards accepted: <code>If-None-Match: *</code></p>
+<p><strong>Errors:</strong> <span class="badge badge-red">404</span> scoreboard not found or inactive</p>
+
+<!-- ─────────── WEBSOCKET ─────────── -->
+<h2 id="websocket">5. WebSocket Events (Socket.io)</h2>
+
+<p>
+  <strong>Connection URL:</strong> <code>https://scoreboard.ubiconet.com</code> (or <code>http://localhost:4020</code> in dev)<br>
+  <strong>Transports:</strong> <code>websocket</code>, <code>polling</code> (fallback)
+</p>
+
+<h3>Client → Server Events</h3>
+
+<table>
+  <thead><tr><th>Event</th><th>Payload</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>subscribe</code></td>
+      <td><code>scoreboardId: number</code></td>
+      <td>Join a scoreboard's update room. Only receive updates for subscribed boards.</td>
+    </tr>
+    <tr>
+      <td><code>unsubscribe</code></td>
+      <td><code>scoreboardId: number</code></td>
+      <td>Leave a scoreboard's room.</td>
+    </tr>
+    <tr>
+      <td><code>state:change</code></td>
+      <td><code>{ scoreboardId, patch }</code></td>
+      <td>Push a state change directly. Server persists, increments version, broadcasts to all <strong>other</strong> clients in the room. Sender excluded from echo.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong><code>state:change</code> example:</strong></p>
+<pre><code>socket.emit('state:change', {
+  scoreboardId: 1,
+  patch: { homeScore: 5, balls: 2, strikes: 1 }
+});</code></pre>
+<p>The <code>patch</code> uses the same field names and validation rules as <code>PUT /api/scoreboards/:id/state</code>.</p>
+
+<h3>Server → Client Events</h3>
+
+<table>
+  <thead><tr><th>Event</th><th>Payload</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>state:update</code></td>
+      <td>Display State (compact)</td>
+      <td>Broadcast whenever a scoreboard's state changes — via REST <code>PUT /state</code> or socket <code>state:change</code>. Same shape as display endpoint.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Recommended Client Patterns</h3>
+
+<p><strong>Operator control panel (the web UI):</strong></p>
+<pre><code>// 1. Connect socket
+const socket = io('https://scoreboard.ubiconet.com');
+
+// 2. Subscribe to a scoreboard
+socket.emit('subscribe', 1);
+
+// 3. Listen for state changes from other operators
+socket.on('state:update', (payload) => {
+  // payload = { h, a, i, hf, b, s, o, v }
+  renderScoreboard(payload);
+});
+
+// 4. Push a change instantly (no REST round trip)
+socket.emit('state:change', {
+  scoreboardId: 1,
+  patch: { homeScore: 5, inning: 6 }
+});</code></pre>
+
+<p><strong>Electronic display board (hardware):</strong></p>
+<pre><code>// Option A: WebSocket (recommended — instant updates)
+const socket = io('https://scoreboard.ubiconet.com');
+socket.emit('subscribe', 1);
+socket.on('state:update', renderScoreboard);
+
+// Option B: Poll display endpoint with ETag (fallback)
+let etag = null;
+setInterval(async () => {
+  const res = await fetch('https://scoreboard.ubiconet.com/display/field-1', {
+    headers: etag ? { 'If-None-Match': etag } : {}
+  });
+  if (res.status === 304) return;        // unchanged — keep current state
+  etag = res.headers.get('ETag');
+  const state = await res.json();
+  renderScoreboard(state);
+}, 5000);</code></pre>
+
+<!-- ─────────── VALIDATION ─────────── -->
+<h2 id="validation">6. Validation Rules</h2>
+
+<table>
+  <thead><tr><th>Field</th><th>Rule</th></tr></thead>
+  <tbody>
+    <tr><td><code>uniqueIdentifier</code></td><td>Required. String. 1–100 chars. Pattern: <code>[a-zA-Z0-9_-]+</code></td></tr>
+    <tr><td><code>displayName</code></td><td>Optional. String. Max 200 chars.</td></tr>
+    <tr><td><code>homeTeamName</code></td><td>Optional. String. Max 200 chars.</td></tr>
+    <tr><td><code>awayTeamName</code></td><td>Optional. String. Max 200 chars.</td></tr>
+    <tr><td><code>homeScore</code></td><td>Non-negative integer (≥ 0)</td></tr>
+    <tr><td><code>awayScore</code></td><td>Non-negative integer (≥ 0)</td></tr>
+    <tr><td><code>inning</code></td><td>Integer ≥ 1</td></tr>
+    <tr><td><code>half</code></td><td><code>"top"</code> or <code>"bottom"</code></td></tr>
+    <tr><td><code>balls</code></td><td>Integer 0–3</td></tr>
+    <tr><td><code>strikes</code></td><td>Integer 0–2</td></tr>
+    <tr><td><code>outs</code></td><td>Integer 0–2</td></tr>
+    <tr><td><code>gameId</code></td><td>String or <code>null</code></td></tr>
+  </tbody>
+</table>
+
+<!-- ─────────── ERRORS ─────────── -->
+<h2 id="errors">7. Error Handling</h2>
+
+<p>All errors return JSON:</p>
+<pre><code>{ "error": "Human-readable error message" }</code></pre>
+
+<table>
+  <thead><tr><th>Status</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td><span class="badge">400</span></td><td>Validation error (missing field, out-of-range value, invalid format)</td></tr>
+    <tr><td><span class="badge badge-red">404</span></td><td>Scoreboard not found by <code>id</code> or <code>identifier</code></td></tr>
+    <tr><td><span class="badge badge-red">409</span></td><td><code>uniqueIdentifier</code> already exists (on create or update)</td></print>
+    <tr><td><span class="badge badge-red">500</span></td><td>Internal server error</td></tr>
+  </tbody>
+</table>
+
+<h3>Health Check</h3>
+<div class="endpoint">
+  <span class="method method-get">GET</span>
+  <span class="path">/health</span>
+</div>
+<pre><code>{ "status": "ok" }</code></pre>
+
+<div class="footer">
+  Scoreboard API — <a href="https://scoreboard.ubiconet.com">https://scoreboard.ubiconet.com</a>
+</div>
+
+</body>
+</html>

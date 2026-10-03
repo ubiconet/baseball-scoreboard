@@ -1,0 +1,22 @@
+# Order matters — specific proxy rules FIRST, SPA fallback LAST so the
+# React Router still gets unknown paths but API + HLS + WebSocket
+# routes reach the backend running behind the Cloudflare Tunnel at
+# https://scoreboard.ubiconet.com.
+
+# Backend display + state routes — must be proxied before the SPA
+# fallback below so the watch page can fetch scoreboard data and
+# subscribe to live updates from the operator's machine.
+# Netlify proxy requires an absolute URL.
+/display/* https://scoreboard.ubiconet.com/display/:splat 200
+/api/*    https://scoreboard.ubiconet.com/api/:splat    200
+
+# HLS playlist + segments for the Direct-stream watch view.
+/stream-hls/* https://scoreboard.ubiconet.com/stream-hls/:splat 200
+
+# Socket.io connection — the watch page subscribes to live state:update
+# pushes here. Proxied so WebSocket upgrades succeed through Netlify.
+/socket.io/* https://scoreboard.ubiconet.com/socket.io/:splat 200
+
+# SPA fallback — unknown paths serve index.html so React Router
+# handles /watch/:identifier and any other client-side routes.
+/* /index.html 200

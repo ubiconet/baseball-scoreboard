@@ -1,0 +1,29 @@
+# build artifacts
+node_modules/
+dist/
+build/
+*.log
+logs/
+
+# env & secrets
+.env
+.env.*
+*.local
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# scratch yt test scripts
+yt_check*.mjs
+test-stream/
