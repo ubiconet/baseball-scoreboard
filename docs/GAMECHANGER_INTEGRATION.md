@@ -123,6 +123,103 @@ Response: `{ access: { data: <new JWT> }, refresh: { data: <new refresh token> }
 **Concurrency lock**: per-tenancy promise map prevents refresh storms. On 401 from refresh →
 clear tokens, require re-login.
 
+### Auth on the wire — captured request/response examples
+
+> Captured 2026-10-03 from the production integration (scoreboard id 6). Secrets are
+> truncated/redacted — shapes and field semantics are exact.
+
+**Token response body** (captured by the Selenium interceptor from
+`POST https://api.team-manager.gc.com/auth` — the same shape comes back for login and
+refresh; this is what gets stored as `gc_auth_token` in the DB):
+
+```json
+{
+  "type": "token",
+  "access": {
+    "data": "eyJhbGciOiJSUzI1NiIs...<RS256 JWT, ~700 chars>",
+    "expires": 1785109600
+  },
+  "refresh": {
+    "data": "eyJhbGciOiJIUzI1NiIs...<HS256 JWT, 457 chars>",
+    "expires": 1786315305
+  }
+}
+```
+
+Decoded **access JWT payload** (header alg `RS256`; note `cid` = the signing client id,
+`rtkn` = the refresh-token lineage id):
+
+```json
+{
+  "type": "user",
+  "cid": "86fdf441-602b-49dc-9c67-f603a07b2fbf",
+  "email": "<user email>",
+  "userId": "<uuid>",
+  "rtkn": "<uuid>:<uuid>",
+  "iat": 1785105705,
+  "exp": 1785109600
+}
+```
+
+→ **access token lifetime ≈ 65 minutes** (`exp - iat = 3895s`). Decode the payload's
+`cid` at login time and persist it as the scoreboard's `gc_client_id`.
+
+Decoded **refresh JWT payload** (header alg `HS256`):
+
+```json
+{
+  "id": "<uuid>:<uuid>",
+  "cid": "86fdf441-602b-49dc-9c67-f603a07b2fbf",
+  "uid": "<uuid>",
+  "email": "<user email>",
+  "iat": 1785105705,
+  "exp": 1786315305
+}
+```
+
+→ **refresh token lifetime ≈ 14 days** (`exp - iat = 1209600s`). `id` here matches
+`rtkn` in the access token — GC rotates the lineage on every refresh.
+
+**Refresh request** (exact headers as sent by `executeRefresh()`):
+
+```http
+POST https://api.team-manager.gc.com/auth HTTP/1.1
+Content-Type: application/json; charset=utf-8
+Gc-App-Name: web
+Gc-App-Version: 0.0.0
+Gc-Client-Id: 86fdf441-602b-49dc-9c67-f603a07b2fbf
+Gc-Device-Id: <md5 hex, stable per user>
+Gc-Timestamp: 1791066407
+Gc-Signature: <43-char base64 nonce>.<44-char base64 HMAC-SHA256>
+Gc-Token: <current refresh JWT>
+
+{"type":"refresh"}
+```
+
+**Refresh failure response** (observed when the stored refresh token is stale/already
+rotated — GC returns plain text, NOT JSON, with empty `statusText`):
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: text/plain; charset=utf-8
+Content-Length: 12
+gc-timestamp: 1791066407
+X-Cache: Error from cloudfront
+Via: 1.1 <cloudfront pop>
+
+Unauthorized
+```
+
+**Data API request** (all `GET` endpoints — signing NOT required, only these 3-4 headers):
+
+```http
+GET https://api.team-manager.gc.com/public/teams/<teamId>/games HTTP/1.1
+Gc-App-Name: web
+Gc-Device-Id: <md5 hex, stable per user>
+Gc-Client-Id: <cid from JWT>
+Gc-Token: <access JWT>
+```
+
 ---
 
 ## 3. Data API Endpoints
