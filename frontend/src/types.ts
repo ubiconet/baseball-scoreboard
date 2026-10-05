@@ -24,15 +24,20 @@ export interface Scoreboard {
   createdAt: string;
   updatedAt: string;
 
-  // Streaming — YouTube and/or Twitch can be configured; streamPlatform
-  // picks which one is active.
-  streamPlatform: 'youtube' | 'twitch';
+  // Streaming — YouTube, Twitch and/or GameChanger can be configured;
+  // streamPlatform picks which one is active.
+  streamPlatform: 'youtube' | 'twitch' | 'gamechanger';
   // YouTube (OAuth-driven; streamKeyMasked reflects the current broadcast's
   // stream name when a broadcast is active, otherwise the channel-level key)
   streamKeyMasked?: string;
   // Twitch (manual key paste)
   twitchStreamKeyMasked?: string;
   twitchChannelName: string | null;
+  // GameChanger (manual per-event URL + key paste; both rotate per event).
+  // The URL is not secret — GC embeds it openly — but the key is only
+  // ever exposed masked.
+  gamechangerStreamKeyMasked?: string;
+  gamechangerStreamUrl: string | null;
   streamEnabled: boolean;
   streamStatus: 'idle' | 'starting' | 'live' | 'stopping' | 'error';
   streamLastError: string | null;
@@ -59,7 +64,7 @@ export interface StreamStatusPayload {
   isConnected: boolean;
   // Active streaming platform (which destination the current/next stream
   // will be pushed to). Added 2026 when the platform selector shipped.
-  platform?: 'youtube' | 'twitch';
+  platform?: 'youtube' | 'twitch' | 'gamechanger';
   // Masked key for the ACTIVE platform only. Other platform's key is
   // exposed on its dedicated settings endpoint, never here.
   streamKeyMasked?: string;
@@ -92,10 +97,12 @@ export interface StreamStatusPayload {
 export interface StreamInfo {
   status: 'idle' | 'starting' | 'live' | 'stopping' | 'error';
   mode?: 'youtube' | 'direct';
-  // Active streaming platform — 'twitch' is added alongside 'youtube' and
-  // 'direct' (the latter is the local ffmpeg HLS path). The watch page
-  // picks which embed to render based on this.
-  platform?: 'youtube' | 'twitch' | 'direct';
+  // Active streaming platform — 'twitch' and 'gamechanger' are added
+  // alongside 'youtube' and 'direct' (the latter is the local ffmpeg HLS
+  // path). The watch page picks which embed to render based on this.
+  // (GameChanger has no public embed — the watch page shows no player
+  // for it; viewers watch inside the GC app.)
+  platform?: 'youtube' | 'twitch' | 'gamechanger' | 'direct';
   youtubeWatchUrl?: string | null;
   youtubeEmbedUrl?: string | null;
   directHlsUrl?: string | null;

@@ -1,11 +1,15 @@
 /**
  * StreamSettings — Streaming platform selector + per-platform credentials.
  *
- * Supports two RTMP destinations:
+ * Supports three RTMP destinations:
  *   - YouTube Live — OAuth flow creates per-broadcast stream keys automatically
  *   - Twitch       — operator pastes the stream key from their Twitch dashboard
+ *   - GameChanger  — operator pastes a per-event RTMP URL + stream key from
+ *                    the GC app ("Other Camera → Switch To Insecure Ingest").
+ *                    Unlike Twitch, BOTH URL and key are user inputs and
+ *                    rotate per event — copy fresh ones before each game.
  *
- * Both can be configured at once; the operator picks which one is the active
+ * All can be configured at once; the operator picks which one is the active
  * destination with the platform selector. Switching the active platform does
  * NOT clear the inactive platform's credentials — they're stored in separate
  * DB columns.
@@ -34,6 +38,7 @@ import {
   cameraTune,
   setStreamPreview,
   updateTwitchStreamKey,
+  updateGamechangerStreamKey,
   type StreamStatusPayload,
 } from '../api.js';
 import type { Scoreboard } from '../types.js';
@@ -45,7 +50,7 @@ interface Props {
   scoreboard?: Scoreboard;
 }
 
-type Platform = 'youtube' | 'twitch';
+type Platform = 'youtube' | 'twitch' | 'gamechanger';
 
 interface YouTubeStatus {
   connected: boolean;
@@ -85,6 +90,15 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
   // What the operator is currently typing for the Twitch login. Kept separate
   // from the stored value so we can show "Save" only when changed.
   const [twitchLoginDraft, setTwitchLoginDraft] = useState('');
+  // ── GameChanger drafts ────────────────────────────────────────────
+  // URL is prefilled from the stored per-event value; the key input starts
+  // empty (secret — only the masked form ever comes back from the backend).
+  const [gcUrlDraft, setGcUrlDraft] = useState('');
+  const [gcKey, setGcKey] = useState('');
+  const [savingGc, setSavingGc] = useState(false);
+  // Seeded-once guard so the 5s status poll doesn't clobber the operator's
+  // URL edits (same pattern as the Twitch login draft).
+  const gcUrlSeededRef = useRef(false);
   // Video encoding settings (Pi CLI flags). Drafts track what the operator
   // is currently picking in the dropdowns; the Save button sends them to
   // the backend and updates `stream.encoding` to mirror what persisted.
@@ -187,6 +201,17 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
     const t = setInterval(refresh, 5_000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // Seed the GameChanger URL input once from the stored per-event value so
+  // the operator can see (and tweak) what's configured without retyping it.
+  // Guarded by a ref so later polls don't clobber in-flight edits.
+  useEffect(() => {
+    if (gcUrlSeededRef.current) return;
+    if (scoreboard?.gamechangerStreamUrl) {
+      gcUrlSeededRef.current = true;
+      setGcUrlDraft(scoreboard.gamechangerStreamUrl);
+    }
+  }, [scoreboard?.gamechangerStreamUrl]);
 
   // ── Live camera tuning (debounced) ──────────────────────────────────
   // Brightness/contrast slider drags POST /stream/camera-tune ~400ms after
@@ -299,7 +324,7 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
     try {
       const updated = await setStreamPlatform(scoreboardId, next);
       setStream(updated);
-      setInfo(`Streaming destination switched to ${next === 'youtube' ? 'YouTube' : 'Twitch'}.`);
+      setInfo(`Streaming destination switched to ${next === 'youtube' ? 'YouTube' : next === 'twitch' ? 'Twitch' : 'GameChanger'}.`);
     } catch (e) {
       const ax = e as { response?: { data?: { error?: string } } };
       setError(ax?.response?.data?.error || 'Failed to switch streaming destination');
@@ -396,6 +421,37 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
     }
   };
 
+  // Save the GameChanger RTMP URL + stream key. The URL field is always
+  // sent (prefilled editable value — clearing it clears the stored URL);
+  // the key is only sent when the operator typed one, so a URL-only Save
+  // doesn't wipe the stored key. As with Twitch, the typed key is dropped
+  // from local state right after the submit — only the masked version
+  // ever comes back.
+  const handleSaveGamechanger = async () => {
+    const url = gcUrlDraft.trim();
+    if (url && !url.startsWith('rtmp://') && !url.startsWith('rtmps://')) {
+      setError('GameChanger URL must start with rtmp:// or rtmps:// — copy the insecure ingest URL from the GC app (External Camera → Other Camera).');
+      return;
+    }
+    const key = gcKey.trim();
+    setError(null);
+    setInfo(null);
+    setSavingGc(true);
+    try {
+      const payload: { streamUrl: string | null; streamKey?: string } = { streamUrl: url || null };
+      if (key) payload.streamKey = key;
+      const updated = await updateGamechangerStreamKey(scoreboardId, payload);
+      setStream(updated);
+      setGcKey(''); // drop from local state immediately
+      setInfo('GameChanger stream settings saved.');
+    } catch (e) {
+      const ax = e as { response?: { data?: { error?: string } } };
+      setError(ax?.response?.data?.error || 'Failed to save GameChanger stream settings');
+    } finally {
+      setSavingGc(false);
+    }
+  };
+
   // Persist the encoding dropdown values. Backend accepts partial
   // updates — we send only the fields that differ from the currently
   // persisted values so a Save click without changes is a cheap no-op
@@ -487,15 +543,20 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
   // active platform isn't ready.
   const twitchConfigured = !!scoreboard?.twitchStreamKeyMasked;
   const youtubeConfigured = yt.connected;
-  const activeReady = platform === 'youtube' ? youtubeConfigured : twitchConfigured;
+  const gcConfigured = !!scoreboard?.gamechangerStreamKeyMasked && !!scoreboard?.gamechangerStreamUrl;
+  const activeReady = platform === 'youtube'
+    ? youtubeConfigured
+    : platform === 'twitch'
+      ? twitchConfigured
+      : gcConfigured;
 
   return (
     <section className="card section stream-settings">
       <h2 className="section-title">Live Stream</h2>
       <p className="muted small">
-        Configure YouTube and/or Twitch, then choose which one is the active
-        streaming destination. Both share the same Pi camera pipeline — only
-        the RTMP destination changes.
+        Configure YouTube, Twitch and/or GameChanger, then choose which one is
+        the active streaming destination. All share the same Pi camera
+        pipeline — only the RTMP destination changes.
       </p>
 
       {/* ── Pi connection diagnostics ─────────────────────────────────────
@@ -575,6 +636,14 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
             disabled={switching}
             onChange={() => handlePlatformSwitch('twitch')}
           />
+          <PlatformRadio
+            value="gamechanger"
+            label="GameChanger"
+            description="Per-event RTMP URL + key from the GC app (Other Camera)."
+            checked={platform === 'gamechanger'}
+            disabled={switching}
+            onChange={() => handlePlatformSwitch('gamechanger')}
+          />
         </div>
         {switching && <div className="muted small" style={{ marginTop: '0.5rem' }}>Switching…</div>}
       </div>
@@ -603,6 +672,19 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
           savingLogin={savingTwitchLogin}
           onClear={handleClearTwitch}
           clearing={clearingTwitch}
+        />
+      )}
+
+      {platform === 'gamechanger' && (
+        <GameChangerPanel
+          streamUrl={scoreboard?.gamechangerStreamUrl ?? null}
+          keyMasked={scoreboard?.gamechangerStreamKeyMasked}
+          typedUrl={gcUrlDraft}
+          onTypedUrlChange={setGcUrlDraft}
+          typedKey={gcKey}
+          onTypedKeyChange={setGcKey}
+          onSave={handleSaveGamechanger}
+          saving={savingGc}
         />
       )}
 
@@ -896,7 +978,9 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
         <p className="muted small" style={{ marginTop: '0.5rem' }}>
           {platform === 'youtube'
             ? 'No YouTube account connected — Start Stream will fail until you connect one below.'
-            : 'No Twitch stream key configured — Start Stream will fail until you paste one below.'}
+            : platform === 'twitch'
+              ? 'No Twitch stream key configured — Start Stream will fail until you paste one below.'
+              : 'No GameChanger RTMP URL + key configured — Start Stream will fail until you paste fresh ones below.'}
         </p>
       )}
     </section>
@@ -1246,6 +1330,160 @@ function TwitchPanel({
         <code> stream:cmd </code> with the Twitch ingest URL and your stored key.
         The Pi pushes ffmpeg to Twitch — no broadcast lifecycle to manage, no
         API quota burned. Stop just tells the Pi to shut down ffmpeg.
+      </p>
+    </div>
+  );
+}
+
+interface GameChangerPanelProps {
+  /** Stored per-event RTMP URL (not secret — GC embeds it openly). */
+  streamUrl: string | null;
+  /** Masked stored key. Undefined when no key is saved. */
+  keyMasked?: string;
+  /** What the operator is currently typing in the URL field. */
+  typedUrl: string;
+  onTypedUrlChange: (v: string) => void;
+  /** What the operator is currently typing in the key field (raw, never persisted client-side). */
+  typedKey: string;
+  onTypedKeyChange: (v: string) => void;
+  onSave: () => void;
+  saving: boolean;
+}
+
+function GameChangerPanel({
+  streamUrl,
+  keyMasked,
+  typedUrl,
+  onTypedUrlChange,
+  typedKey,
+  onTypedKeyChange,
+  onSave,
+  saving,
+}: GameChangerPanelProps) {
+  const hasStoredKey = !!keyMasked;
+  const hasStoredUrl = !!streamUrl;
+
+  // Live client-side validation so the operator sees a problem before Save.
+  const urlTrimmed = typedUrl.trim();
+  const urlLooksOk = urlTrimmed.length === 0 || urlTrimmed.startsWith('rtmp://') || urlTrimmed.startsWith('rtmps://');
+  const keyTrimmed = typedKey.trim();
+  const hasChanges = urlTrimmed !== (streamUrl ?? '') || keyTrimmed.length > 0;
+
+  return (
+    <div className="gamechanger-config-panel" data-testid="gamechanger-config-panel">
+      <div className="stream-status-grid">
+        <div className="metric">
+          <span>GameChanger RTMP URL</span>
+          <b>
+            {hasStoredUrl ? (
+              <code data-testid="gc-url-stored">{streamUrl}</code>
+            ) : (
+              <span className="error-text">Not configured</span>
+            )}
+          </b>
+        </div>
+        <div className="metric">
+          <span>GameChanger Stream Key</span>
+          <b>
+            {hasStoredKey ? (
+              <span>
+                key saved (<code data-testid="gc-key-masked">{keyMasked}</code>)
+              </span>
+            ) : (
+              <span className="error-text">Not configured</span>
+            )}
+          </b>
+        </div>
+      </div>
+
+      <div style={{ marginTop: '1rem' }}>
+        {/* ── Per-event RTMP URL ─────────────────────────────────────── */}
+        <label style={{ display: 'block', marginBottom: '0.5rem' }}>
+          <strong>RTMP URL</strong>
+          <input
+            type="text"
+            value={typedUrl}
+            onChange={(e) => onTypedUrlChange(e.target.value)}
+            placeholder="rtmp://…  (from GC app → External Camera → Other Camera)"
+            disabled={saving}
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            data-testid="gc-url-input"
+            style={{
+              display: 'block',
+              width: '100%',
+              marginTop: '0.25rem',
+              padding: '0.5rem',
+              background: 'var(--bg-alt, rgba(255,255,255,0.04))',
+              border: `1px solid ${urlTrimmed && !urlLooksOk ? 'var(--error, #ef4444)' : 'var(--border, #333)'}`,
+              borderRadius: 4,
+              color: 'inherit',
+              font: 'inherit',
+              fontFamily: 'monospace',
+            }}
+          />
+        </label>
+        {urlTrimmed && !urlLooksOk && (
+          <div className="error-text small" style={{ marginBottom: '0.5rem' }}>
+            The URL must start with rtmp:// or rtmps:// — copy the insecure
+            ingest URL from the GC app (External Camera → Other Camera).
+          </div>
+        )}
+
+        {/* ── Per-event stream key ───────────────────────────────────── */}
+        <label style={{ display: 'block', marginBottom: '0.5rem' }}>
+          <strong>Stream key</strong>
+          <input
+            type="password"
+            value={typedKey}
+            onChange={(e) => onTypedKeyChange(e.target.value)}
+            placeholder={hasStoredKey ? 'Paste a new key to replace the stored one' : 'Paste your GameChanger stream key'}
+            disabled={saving}
+            autoComplete="off"
+            data-testid="gc-key-input"
+            style={{
+              display: 'block',
+              width: '100%',
+              marginTop: '0.25rem',
+              padding: '0.5rem',
+              background: 'var(--bg-alt, rgba(255,255,255,0.04))',
+              border: '1px solid var(--border, #333)',
+              borderRadius: 4,
+              color: 'inherit',
+              font: 'inherit',
+              fontFamily: 'monospace',
+            }}
+          />
+        </label>
+
+        <div className="muted small" style={{ marginBottom: '0.75rem' }}>
+          URL and key are per-event — copy fresh ones from the GameChanger app
+          before each game. The key is sent to the backend over HTTPS and
+          stored in the database — only a masked version
+          (<code>{keyMasked ?? '****XXXX'}</code>) is ever shown in the UI.
+        </div>
+
+        <div className="stream-buttons">
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={onSave}
+            disabled={saving || !urlLooksOk || !hasChanges}
+            data-testid="gc-save"
+          >
+            {saving ? 'Saving…' : 'Save GameChanger Settings'}
+          </button>
+        </div>
+      </div>
+
+      <p className="muted small" style={{ marginTop: '1rem' }}>
+        <strong>How it works:</strong> When you click Start Stream (with
+        GameChanger selected as the active destination), the backend sends the
+        Pi a <code> stream:cmd </code> with this RTMP URL and your stored key.
+        The Pi pushes ffmpeg straight to GameChanger's insecure ingest — no
+        broadcast lifecycle to manage. Stop just tells the Pi to shut down
+        ffmpeg.
       </p>
     </div>
   );

@@ -1,11 +1,16 @@
 // ── Streaming platform ────────────────────────────────────────────────────
-// Two RTMP destinations are supported. The active target is selected by
-// streamPlatform; both can be configured simultaneously so the operator
+// Three RTMP destinations are supported. The active target is selected by
+// streamPlatform; all can be configured simultaneously so the operator
 // can swap mid-game (e.g. YouTube primary, Twitch backup).
-export type StreamPlatform = 'youtube' | 'twitch';
+// 'gamechanger' has NO fixed ingest — its RTMP URL is a per-event user
+// input, so it is deliberately excluded from STREAM_INGEST_URLS.
+export type StreamPlatform = 'youtube' | 'twitch' | 'gamechanger';
 
-/** RTMP ingest URLs per platform — used by stream.ts to build the stream:cmd. */
-export const STREAM_INGEST_URLS: Record<StreamPlatform, string> = {
+/** RTMP ingest URLs per platform — used by stream.ts to build the stream:cmd.
+ *  GameChanger is excluded: it has no fixed ingest (per-event URL pasted by
+ *  the operator), so only youtube/twitch can be looked up here. Consumers
+ *  must resolve the gamechanger URL from the row's gc_stream_url instead. */
+export const STREAM_INGEST_URLS: Record<Exclude<StreamPlatform, 'gamechanger'>, string> = {
   youtube: 'rtmp://a.rtmp.youtube.com/live2',
   twitch: 'rtmp://live.twitch.tv/app',
 };
@@ -36,9 +41,10 @@ export interface Scoreboard {
   createdAt: string;
   updatedAt: string;
 
-  // Streaming — both YouTube and Twitch are configurable; streamPlatform
-  // picks which one is active. streamKeyMasked + twitchStreamKeyMasked are
-  // both exposed so the Settings UI can show what's configured for each.
+  // Streaming — YouTube, Twitch and GameChanger are all configurable;
+  // streamPlatform picks which one is active. streamKeyMasked +
+  // twitchStreamKeyMasked + gamechangerStreamKeyMasked are all exposed
+  // so the Settings UI can show what's configured for each.
   streamPlatform: StreamPlatform;
   // YouTube (OAuth-driven; streamKeyMasked reflects the current broadcast's
   // stream name when a broadcast is active, otherwise the channel-level key)
@@ -46,6 +52,11 @@ export interface Scoreboard {
   // Twitch (manual key paste)
   twitchStreamKeyMasked?: string;
   twitchChannelName: string | null;
+  // GameChanger (manual per-event URL + key paste). The URL is not
+  // secret — GC embeds it openly — but the key is only ever exposed
+  // masked. Both rotate per event.
+  gamechangerStreamKeyMasked?: string;
+  gamechangerStreamUrl: string | null;
   streamEnabled: boolean;
   streamStatus: 'idle' | 'starting' | 'live' | 'stopping' | 'error';
   streamLastError: string | null;
@@ -158,9 +169,11 @@ export interface ScoreboardRow {
   created_at: Date;
   updated_at: Date;
   stream_key: string | null;
-  stream_platform: 'youtube' | 'twitch';
+  stream_platform: StreamPlatform;
   twitch_stream_key: string | null;
   twitch_channel_name: string | null;
+  gc_stream_url: string | null;
+  gc_stream_key: string | null;
   stream_enabled: boolean;
   stream_status: string;
   stream_last_error: string | null;
@@ -247,9 +260,15 @@ export function mapRowToScoreboard(row: ScoreboardRow): Scoreboard {
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
     updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
     streamKeyMasked: row.stream_key ? maskStreamKey(row.stream_key) : undefined,
-    streamPlatform: (row.stream_platform as 'youtube' | 'twitch') || 'youtube',
+    streamPlatform: (row.stream_platform as StreamPlatform) || 'youtube',
     twitchStreamKeyMasked: row.twitch_stream_key ? maskStreamKey(row.twitch_stream_key) : undefined,
     twitchChannelName: row.twitch_channel_name,
+    // GameChanger: masked key + full URL are always exposed here (the
+    // Scoreboard endpoint feeds the Settings UI regardless of which
+    // platform is active). The /stream/status poll endpoint stays
+    // active-platform-only — see pickActiveKeyMasked in stream.ts.
+    gamechangerStreamKeyMasked: row.gc_stream_key ? maskStreamKey(row.gc_stream_key) : undefined,
+    gamechangerStreamUrl: row.gc_stream_url ?? null,
     streamEnabled: row.stream_enabled,
     streamStatus: (row.stream_status as Scoreboard['streamStatus']) || 'idle',
     streamLastError: row.stream_last_error,

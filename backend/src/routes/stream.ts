@@ -1,10 +1,11 @@
 /**
- * YouTube / Twitch Live Streaming Routes
+ * YouTube / Twitch / GameChanger Live Streaming Routes
  *
  *   GET   /api/scoreboards/:id/stream/status         — current stream status + Pi connection
  *   PUT   /api/scoreboards/:id/stream/key            — save YouTube stream key (legacy/manual)
  *   PUT   /api/scoreboards/:id/stream/twitch/key     — save Twitch stream key + channel name
- *   PUT   /api/scoreboards/:id/stream/platform       — switch active destination (youtube | twitch)
+ *   PUT   /api/scoreboards/:id/stream/gamechanger/key — save GameChanger RTMP URL + stream key
+ *   PUT   /api/scoreboards/:id/stream/platform       — switch active destination (youtube | twitch | gamechanger)
  *   PUT   /api/scoreboards/:id/stream/test-pattern   — toggle test-pattern (Pi pushes testsrc2)
  *   PUT   /api/scoreboards/:id/stream/encoding       — set Pi encoder settings (resolution/fps/audio + A/V tuning)
  *   POST  /api/scoreboards/:id/stream/camera-tune    — live camera brightness/contrast + preview toggle (no restart)
@@ -27,7 +28,7 @@ import { maskStreamKey, type StreamStatus, type StreamPlatform } from '../types.
 
 export const streamRouter = Router();
 
-const VALID_PLATFORMS: StreamPlatform[] = ['youtube', 'twitch'];
+const VALID_PLATFORMS: StreamPlatform[] = ['youtube', 'twitch', 'gamechanger'];
 const VALID_STATUSES: StreamStatus[] = ['idle', 'starting', 'live', 'stopping', 'error'];
 
 // Encoder setting whitelists — kept narrow on purpose so the frontend
@@ -63,6 +64,10 @@ interface StreamRow {
   stream_platform: StreamPlatform;
   twitch_stream_key: string | null;
   twitch_channel_name: string | null;
+  // GameChanger (migration 005) — per-event RTMP URL + key. The URL is
+  // not secret (GC embeds it openly) but the key is only echoed masked.
+  gc_stream_url: string | null;
+  gc_stream_key: string | null;
   stream_enabled: boolean;
   stream_status: string;
   stream_last_error: string | null;
@@ -86,12 +91,16 @@ interface StreamRow {
 /**
  * Pick the masked key + enabled flag for the *active* platform so the
  * frontend's polling endpoint reveals nothing about the inactive platform.
- *   - youtube → stream_key + stream_enabled (which currently drives both modes)
- *   - twitch  → twitch_stream_key + twitch-key-set check
+ *   - youtube     → stream_key + stream_enabled (which currently drives both modes)
+ *   - twitch      → twitch_stream_key + twitch-key-set check
+ *   - gamechanger → gc_stream_key (url readiness is separate — see pickActiveEnabled)
  */
 function pickActiveKeyMasked(row: StreamRow): string | undefined {
   if (row.stream_platform === 'twitch') {
     return row.twitch_stream_key ? maskStreamKey(row.twitch_stream_key) : undefined;
+  }
+  if (row.stream_platform === 'gamechanger') {
+    return row.gc_stream_key ? maskStreamKey(row.gc_stream_key) : undefined;
   }
   return row.stream_key ? maskStreamKey(row.stream_key) : undefined;
 }
@@ -103,6 +112,11 @@ function pickActiveEnabled(row: StreamRow): boolean {
     // name drives the watch-page embed URL — without it, Start would
     // appear to succeed but spectators would see "Stream offline".
     return !!row.twitch_stream_key && !!row.twitch_channel_name && !!row.twitch_channel_name.trim();
+  }
+  if (row.stream_platform === 'gamechanger') {
+    // GC needs BOTH the per-event RTMP URL and the key — unlike Twitch
+    // there is no fixed ingest, so the URL is a required user input.
+    return !!row.gc_stream_key && !!row.gc_stream_url && !!row.gc_stream_url.trim();
   }
   return !!row.stream_enabled;
 }
@@ -162,6 +176,7 @@ streamRouter.get('/:id/stream/status', async (req: Request, res: Response) => {
 
     const row = await queryOne<StreamRow>(
       `SELECT id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
+              gc_stream_url, gc_stream_key,
               stream_enabled, stream_status, stream_last_error,
               stream_started_at, stream_rtmp_url, stream_test_pattern,
               stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast
@@ -228,6 +243,7 @@ streamRouter.put('/:id/stream/key', async (req: Request, res: Response) => {
       `UPDATE scoreboards SET ${updates.join(', ')}
        WHERE id = $${params.length}
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
+                 gc_stream_url, gc_stream_key,
                  stream_enabled, stream_status, stream_last_error,
                  stream_started_at, stream_rtmp_url`,
       params
@@ -331,10 +347,11 @@ streamRouter.put('/:id/stream/twitch/key', async (req: Request, res: Response) =
     const row = await queryOne<StreamRow>(
       `UPDATE scoreboards SET ${sets.join(', ')}
        WHERE id = $${params.length}
-       RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
-                 stream_enabled, stream_status, stream_last_error,
-                 stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
+              RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
+                  gc_stream_url, gc_stream_key,
+                  stream_enabled, stream_status, stream_last_error,
+                  stream_started_at, stream_rtmp_url, stream_test_pattern,
+                  stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       params
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -352,7 +369,113 @@ streamRouter.put('/:id/stream/twitch/key', async (req: Request, res: Response) =
 });
 
 /**
- * PUT active streaming platform. Body: { platform: 'youtube' | 'twitch' }.
+ * PUT GameChanger RTMP URL + stream key. Unlike YouTube/Twitch, GC has no
+ * fixed ingest — BOTH the URL and the key are per-event inputs copied from
+ * the GC app ("Other Camera → Switch To Insecure Ingest (RTMP)"). The full
+ * key is persisted to DB but never echoed back — only a masked version.
+ * Pass `streamKey: ''` to clear the key; `streamUrl: null`/`''` clears the URL.
+ *
+ * Body: { streamUrl?: string | null, streamKey?: string }
+ */
+streamRouter.put('/:id/stream/gamechanger/key', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid scoreboard id' });
+    }
+
+    const { streamUrl, streamKey } = req.body as { streamUrl?: unknown; streamKey?: unknown };
+
+    // Either field can be omitted (= "don't touch"), or explicitly set.
+    // Require at least one so we don't accept no-op PUTs.
+    if (streamUrl === undefined && streamKey === undefined) {
+      return res.status(400).json({ error: 'Provide streamUrl and/or streamKey' });
+    }
+
+    // streamUrl validation: string (or null to clear), and when non-empty
+    // it must be an RTMP(S) ingest — GC's insecure ingest is rtmp:// or
+    // rtmps://. Empty/whitespace/null = clear.
+    let updateUrl = false;
+    let newUrl: string | null | undefined = undefined;
+    if (streamUrl !== undefined) {
+      if (streamUrl === null) {
+        updateUrl = true;
+        newUrl = null;
+      } else if (typeof streamUrl === 'string') {
+        const trimmed = streamUrl.trim();
+        if (trimmed.length === 0) {
+          updateUrl = true;
+          newUrl = null;
+        } else {
+          if (trimmed.length > 2048) {
+            return res.status(400).json({ error: 'streamUrl too long (max 2048 chars)' });
+          }
+          if (!trimmed.startsWith('rtmp://') && !trimmed.startsWith('rtmps://')) {
+            return res.status(400).json({ error: 'streamUrl must start with rtmp:// or rtmps:// — copy the insecure ingest URL from the GC app (External Camera → Other Camera)' });
+          }
+          updateUrl = true;
+          newUrl = trimmed;
+        }
+      } else {
+        return res.status(400).json({ error: 'streamUrl must be a string or null' });
+      }
+    }
+
+    // streamKey validation: string, length 0..512. Empty string = explicit
+    // clear. Omitted = leave unchanged.
+    let updateKey = false;
+    let newKey: string | null | undefined = undefined;
+    if (streamKey !== undefined) {
+      if (typeof streamKey !== 'string') {
+        return res.status(400).json({ error: 'streamKey must be a string (use "" to clear)' });
+      }
+      if (streamKey.length > 512) {
+        return res.status(400).json({ error: 'streamKey too long (max 512 chars)' });
+      }
+      updateKey = true;
+      newKey = streamKey.length > 0 ? streamKey : null;
+    }
+
+    // Build the SET clause from whichever fields were provided.
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (updateUrl) {
+      params.push(newUrl);
+      sets.push(`gc_stream_url = $${params.length}`);
+    }
+    if (updateKey) {
+      params.push(newKey);
+      sets.push(`gc_stream_key = $${params.length}`);
+    }
+    params.push(id);
+
+    const row = await queryOne<StreamRow>(
+      `UPDATE scoreboards SET ${sets.join(', ')}
+       WHERE id = $${params.length}
+       RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
+                 gc_stream_url, gc_stream_key,
+                 stream_enabled, stream_status, stream_last_error,
+                 stream_started_at, stream_rtmp_url, stream_test_pattern,
+                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
+      params
+    );
+    if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
+
+    const isConnected = !!getSocketForScoreboard(id);
+    res.json({
+      success: true,
+      ...buildStatusResponse(row, isConnected),
+      gamechangerStreamUrl: row.gc_stream_url,
+      gamechangerStreamKeyMasked: row.gc_stream_key ? maskStreamKey(row.gc_stream_key) : undefined,
+    });
+  } catch (err) {
+    console.error('[stream] update gamechanger key error:', err);
+    res.status(500).json({ error: 'Failed to update GameChanger stream settings' });
+  }
+});
+
+/**
+ * PUT active streaming platform. Body: { platform: 'youtube' | 'twitch' | 'gamechanger' }.
  *
  * Refuses to switch mid-stream — the operator must Stop first. Switching
  * platforms does not touch the other platform's credentials (they live in
@@ -395,9 +518,10 @@ streamRouter.put('/:id/stream/platform', async (req: Request, res: Response) => 
       `UPDATE scoreboards SET stream_platform = $1
        WHERE id = $2
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
-                 stream_enabled, stream_status, stream_last_error,
-                 stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
+                  gc_stream_url, gc_stream_key,
+                  stream_enabled, stream_status, stream_last_error,
+                  stream_started_at, stream_rtmp_url, stream_test_pattern,
+                  stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       [newPlatform, id]
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -432,9 +556,10 @@ streamRouter.put('/:id/stream/test-pattern', async (req: Request, res: Response)
       `UPDATE scoreboards SET stream_test_pattern = $1
        WHERE id = $2
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
-                 stream_enabled, stream_status, stream_last_error,
-                 stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
+                  gc_stream_url, gc_stream_key,
+                  stream_enabled, stream_status, stream_last_error,
+                  stream_started_at, stream_rtmp_url, stream_test_pattern,
+                  stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       [enabled, id]
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -597,6 +722,7 @@ streamRouter.put('/:id/stream/encoding', async (req: Request, res: Response) => 
     if (sets.length === 0) {
       const cur = await queryOne<StreamRow>(
         `SELECT id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
+                gc_stream_url, gc_stream_key,
                 stream_enabled, stream_status, stream_last_error,
                 stream_started_at, stream_rtmp_url, stream_test_pattern,
                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast
@@ -615,9 +741,10 @@ streamRouter.put('/:id/stream/encoding', async (req: Request, res: Response) => 
       `UPDATE scoreboards SET ${sets.join(', ')}
        WHERE id = $${params.length}
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
-                 stream_enabled, stream_status, stream_last_error,
-                 stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
+                  gc_stream_url, gc_stream_key,
+                  stream_enabled, stream_status, stream_last_error,
+                  stream_started_at, stream_rtmp_url, stream_test_pattern,
+                  stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       params
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -797,6 +924,8 @@ streamRouter.post('/:id/stream/start', async (req: Request, res: Response) => {
     stream_platform: StreamPlatform;
     twitch_stream_key: string | null;
     twitch_channel_name: string | null;
+    gc_stream_url: string | null;
+    gc_stream_key: string | null;
     stream_status: string;
     stream_test_pattern: boolean;
     // Encoder settings — read here so we can include them in the
@@ -813,6 +942,7 @@ streamRouter.post('/:id/stream/start', async (req: Request, res: Response) => {
     stream_camera_contrast: number | null;
   }>(
     `SELECT youtube_channel_id, stream_platform, twitch_stream_key, twitch_channel_name,
+            gc_stream_url, gc_stream_key,
             stream_status, stream_test_pattern,
             stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast
      FROM scoreboards WHERE id = $1`,
@@ -890,6 +1020,18 @@ streamRouter.post('/:id/stream/start', async (req: Request, res: Response) => {
       streamKey = sb.twitch_stream_key;
       rtmpUrl = 'rtmp://live.twitch.tv/app';
       // broadcastId is unused for Twitch — Helix doesn't have a broadcast lifecycle.
+    } else if (sb.stream_platform === 'gamechanger') {
+      // GameChanger: both the per-event RTMP URL and the key are operator
+      // inputs (no fixed ingest exists). The URL rotates per event — copy
+      // it fresh from the GC app before each game.
+      if (!sb.gc_stream_url || !sb.gc_stream_url.trim()) {
+        throw new Error('No GameChanger RTMP URL configured. Copy it from the GC app (External Camera → Other Camera) into Settings → Live Stream → GameChanger.');
+      }
+      if (!sb.gc_stream_key) {
+        throw new Error('No GameChanger stream key configured. Add one in Settings → Live Stream → GameChanger.');
+      }
+      streamKey = sb.gc_stream_key;
+      rtmpUrl = sb.gc_stream_url.trim();
     } else {
       // YouTube path — OAuth-driven, creates a fresh broadcast per start.
       if (!sb.youtube_channel_id) {

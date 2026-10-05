@@ -39,9 +39,11 @@ CREATE TABLE IF NOT EXISTS scoreboards (
 
     -- YouTube Live streaming (Pi streams via ffmpeg → RTMP)
     stream_key          TEXT,                              -- YouTube stream key (per-scoreboard)
-    stream_platform     TEXT NOT NULL DEFAULT 'youtube' CHECK (stream_platform IN ('youtube','twitch')),
+    stream_platform     TEXT NOT NULL DEFAULT 'youtube' CHECK (stream_platform IN ('youtube','twitch','gamechanger')),
     twitch_stream_key   TEXT,                              -- Twitch stream key (operator-pasted)
     twitch_channel_name TEXT,                              -- Optional Twitch channel label (display only)
+    gc_stream_url       TEXT,                              -- GameChanger per-event RTMP ingest URL (rotates per event — no fixed ingest)
+    gc_stream_key       TEXT,                              -- GameChanger per-event stream key (rotates with the URL per event)
     stream_enabled      BOOLEAN NOT NULL DEFAULT false,    -- user opt-in for streaming
     stream_status       TEXT NOT NULL DEFAULT 'idle',      -- idle | starting | live | stopping | error
     stream_last_error   TEXT,

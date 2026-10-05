@@ -16,7 +16,7 @@
  *   - initialStatus: StreamStatus from the scoreboard (server-known state at mount)
  *   - initialKeyMasked: string | undefined
  *   - initialRtmpUrl: string | null
- *   - initialPlatform: 'youtube' | 'twitch' (which destination is active)
+ *   - initialPlatform: 'youtube' | 'twitch' | 'gamechanger' (which destination is active)
  *   - onRequestSettings: parent callback to open Settings tab
  */
 
@@ -29,7 +29,7 @@ import {
 } from '../api.js';
 import type { StreamStatusPayload, StreamStatus } from '../types.js';
 
-type Platform = 'youtube' | 'twitch';
+type Platform = 'youtube' | 'twitch' | 'gamechanger';
 
 interface Props {
   scoreboardId: number;
@@ -61,6 +61,7 @@ const STATUS_LABEL: Record<StreamStatus, string> = {
 const PLATFORM_LABEL: Record<Platform, string> = {
   youtube: 'YouTube Live',
   twitch: 'Twitch',
+  gamechanger: 'GameChanger',
 };
 
 function formatElapsed(iso: string | null): string {
@@ -178,7 +179,7 @@ export default function StreamPanel({
       setError(msg);
       // Surface credential-related errors by jumping to Settings.
       const m = msg.toLowerCase();
-      if ((m.includes('youtube') || m.includes('twitch')) && onRequestSettings) {
+      if ((m.includes('youtube') || m.includes('twitch') || m.includes('gamechanger')) && onRequestSettings) {
         onRequestSettings();
       }
       // Refresh to get backend's view
@@ -230,9 +231,13 @@ export default function StreamPanel({
   // Reason Start is disabled — shown in a muted hint to help the operator.
   const disableReason = (() => {
     if (status.streamEnabled === false) {
-      return platform === 'twitch'
-        ? 'No Twitch stream key configured. Add one in Settings.'
-        : 'No YouTube account connected. Connect one in Settings.';
+      if (platform === 'twitch') {
+        return 'No Twitch stream key configured. Add one in Settings.';
+      }
+      if (platform === 'gamechanger') {
+        return 'No GameChanger RTMP URL + key configured. Add them in Settings.';
+      }
+      return 'No YouTube account connected. Connect one in Settings.';
     }
     if (isLive) return 'Stream is live — Stop first.';
     if (status.status === 'starting') return 'Stream is starting…';

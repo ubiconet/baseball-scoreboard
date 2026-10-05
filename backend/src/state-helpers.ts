@@ -35,9 +35,13 @@ export interface ScoreboardRow {
   created_at: Date;
   updated_at: Date;
   stream_key: string | null;
-  stream_platform: 'youtube' | 'twitch';
+  stream_platform: 'youtube' | 'twitch' | 'gamechanger';
   twitch_stream_key: string | null;
   twitch_channel_name: string | null;
+  // GameChanger streaming (migration 005) — per-event RTMP URL + key,
+  // both operator-pasted and rotating per event.
+  gc_stream_url: string | null;
+  gc_stream_key: string | null;
   stream_enabled: boolean;
   stream_status: string;
   stream_last_error: string | null;

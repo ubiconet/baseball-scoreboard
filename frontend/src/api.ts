@@ -217,6 +217,22 @@ export async function updateTwitchStreamKey(
 }
 
 /**
+ * Save the GameChanger RTMP URL + stream key (operator-pasted from the GC
+ * app's "Other Camera → Switch To Insecure Ingest (RTMP)" flow). Unlike
+ * Twitch, BOTH fields are per-event user inputs — GC has no fixed ingest.
+ * Pass streamKey='' to clear the key; streamUrl=''/null clears the URL.
+ * The full key is persisted to DB but never echoed back — only a masked
+ * version is returned.
+ */
+export async function updateGamechangerStreamKey(
+  id: number,
+  payload: { streamUrl?: string | null; streamKey?: string }
+): Promise<StreamStatusPayload & { gamechangerStreamUrl?: string | null; gamechangerStreamKeyMasked?: string }> {
+  const res = await client.put(`/scoreboards/${id}/stream/gamechanger/key`, payload);
+  return res.data;
+}
+
+/**
  * Switch which platform is the active streaming destination. Refuses while
  * a stream is starting/live — operator must Stop first. Also refuses if
  * the requested platform has no credentials configured (returns a friendly
@@ -224,7 +240,7 @@ export async function updateTwitchStreamKey(
  */
 export async function setStreamPlatform(
   id: number,
-  platform: 'youtube' | 'twitch'
+  platform: 'youtube' | 'twitch' | 'gamechanger'
 ): Promise<StreamStatusPayload> {
   const res = await client.put<StreamStatusPayload>(`/scoreboards/${id}/stream/platform`, { platform });
   return res.data;
@@ -262,7 +278,7 @@ export async function youtubeDisconnect(id: number): Promise<{ success: boolean 
 export async function streamStart(
   id: number,
   opts: { testPattern?: boolean; title?: string; description?: string } = {}
-): Promise<{ success: boolean; status: string; rtmpUrl?: string; isConnected: boolean; platform?: 'youtube' | 'twitch' }> {
+): Promise<{ success: boolean; status: string; rtmpUrl?: string; isConnected: boolean; platform?: 'youtube' | 'twitch' | 'gamechanger' }> {
   // Only include testPattern in the body when explicitly provided.
   // Omitting it lets the backend fall back to the persisted setting
   // (set via Settings → Test Pattern).
