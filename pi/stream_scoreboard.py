@@ -752,12 +752,20 @@ class FFmpegStreamer:
             # Consumer: ffmpeg reads the raw PCM on stdin and encodes
             # AAC ADTS into the FIFO. Format pins must match arecord's
             # output exactly (-f s16le, same rate/channels).
+            #
+            # 2026-10-04: +10dB digital gain (volume filter) — the camera
+            # mic (plughw:2,0) captures room tone at ~-37 dBFS RMS, which
+            # is audible but quiet for field use. The mic itself has no
+            # ALSA gain control, so we boost in the encode chain. Peaks
+            # were ~-26 dBFS pre-boost, so +10dB keeps ~4dB of headroom
+            # before clipping.
             audio_cmd = [
                 "ffmpeg", "-y", "-loglevel", "warning",
                 "-f", "s16le",
                 "-ar", str(audio_sample_rate),
                 "-ac", str(audio_channels),
                 "-i", "-",
+                "-af", "volume=10dB",
                 "-c:a", "aac",
                 "-b:a", audio_bitrate,
                 "-ar", str(audio_sample_rate),
