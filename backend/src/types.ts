@@ -60,6 +60,13 @@ export interface Scoreboard {
   streamOutputHeight: number | null;
   streamFps: number;
   streamAudioBitrate: string;
+  // A/V tuning knobs (see migration 004). Gain is applied by the
+  // Pi's ffmpeg audio chain on the next Start; brightness/contrast
+  // are UVC percentages (0..200, 100 = neutral) applied live via
+  // camera_tune AND on the next Start. null = camera default.
+  streamAudioGainDb: number;
+  streamCameraBrightness: number | null;
+  streamCameraContrast: number | null;
   // Team whose GameChanger stream is being polled — the "home" team for
   // viewer-facing highlights. Set on the scoreboard row when GC is
   // connected; null otherwise.
@@ -105,6 +112,13 @@ export interface StreamEncodingSettings {
   outputHeight: number | null;
   fps: number;
   audioBitrate: string;
+  // A/V tuning knobs (migration 004). audioGainDb: ffmpeg volume
+  // filter gain, -10..30 dB (applies on next Start). cameraBrightness
+  // / cameraContrast: UVC 0..200 with 100 neutral, null = camera
+  // default (applies live via camera-tune + on next Start).
+  audioGainDb: number;
+  cameraBrightness: number | null;
+  cameraContrast: number | null;
 }
 
 export interface DisplayState {
@@ -162,6 +176,10 @@ export interface ScoreboardRow {
   stream_output_height: number | null;
   stream_fps: number;
   stream_audio_bitrate: string;
+  // A/V tuning knobs (see backend migration 004).
+  stream_audio_gain_db: number;
+  stream_camera_brightness: number | null;
+  stream_camera_contrast: number | null;
   // Team whose GameChanger stream is being polled — highlighted in the
   // viewer overlay as the "home side" for the local audience. Not used
   // by the editor UI; only relevant to the Pi streamer + watch page so
@@ -249,6 +267,9 @@ export function mapRowToScoreboard(row: ScoreboardRow): Scoreboard {
     streamOutputHeight: row.stream_output_height ?? null,
     streamFps: row.stream_fps ?? 30,
     streamAudioBitrate: row.stream_audio_bitrate ?? '64k',
+    streamAudioGainDb: row.stream_audio_gain_db ?? 10,
+    streamCameraBrightness: row.stream_camera_brightness ?? null,
+    streamCameraContrast: row.stream_camera_contrast ?? null,
     gcTeamName: row.gc_team_name ?? null,
   };
 }

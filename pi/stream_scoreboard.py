@@ -36,6 +36,7 @@ new state:update event arrives OR the cached poll refreshes.
 """
 
 import argparse
+import io
 import logging
 import os
 import signal
@@ -290,6 +291,13 @@ class CameraSource:
         # BGR→RGB. Ignored when format="BGR888" is supported, in which case
         # the explicit cv2-style conversion in read() already handles it.
         self._picam_bgr_fallback = False
+        # Serializes frame access (read / apply_controls / preview_jpeg)
+        # between the streaming render loop, the camera-tune command path,
+        # and the preview emitter thread. Without it, a V4L2 control write
+        # racing a read() can corrupt the capture state.
+        self._lock = threading.Lock()
+        self._cv2 = None
+        self._cap = None
 
         if Picamera2 is not None and device is None:
             try:
@@ -349,6 +357,10 @@ class CameraSource:
             raise RuntimeError(f"Could not open camera {device}: {exc}") from exc
 
     def read(self) -> Optional["Image.Image"]:
+        with self._lock:
+            return self._read_locked()
+
+    def _read_locked(self) -> Optional["Image.Image"]:
         if self._use_picam:
             try:
                 array = self._picam.capture_array()
@@ -372,6 +384,145 @@ class CameraSource:
             return None
         rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
+
+    def apply_controls(self, brightness: Optional[int], contrast: Optional[int]) -> None:
+        """Apply brightness/contrast to the capture device (live).
+
+        Scale is UVC-style percentage: 0..200 with 100 = neutral. Values
+        are clamped to that range. Called by the camera_tune command path
+        (backend slider) and right after camera open on stream start, so
+        the operator's persisted image settings survive a restart.
+
+        2026-10-05: the Centerm camera's V4L2 driver uses NON-UVC ranges
+        (brightness -255..255 default 0, contrast 0..30 default 16). cv2's
+        CAP_PROP setters pass the value straight through, so sending 0..200
+        was a no-op for contrast (clamped to 30) and a nudge for brightness.
+        Fix: query each control's actual min/max/default from the driver on
+        first use and linearly map the 0..200 slider scale onto it
+        (0 → driver min, 100 → driver default, 200 → driver max).
+        """
+        def clamp(v: int) -> int:
+            return max(0, min(200, int(v)))
+
+        def map_to_driver(slider_val: float, dmin: float, dmax: float, ddef: float) -> float:
+            # Piecewise-linear: 0..100 maps min→default, 100..200 maps
+            # default→max. Keeps 100 exactly at the driver default.
+            if slider_val <= 100.0:
+                if dmin == ddef:
+                    return ddef
+                return dmin + (slider_val / 100.0) * (ddef - dmin)
+            if ddef == dmax:
+                return dmax
+            return ddef + ((slider_val - 100.0) / 100.0) * (dmax - ddef)
+
+        with self._lock:
+            if self._use_picam and self._picam is not None:
+                controls = {}
+                if brightness is not None:
+                    controls["Brightness"] = (clamp(brightness) - 100) / 100.0
+                if contrast is not None:
+                    controls["Contrast"] = clamp(contrast) / 100.0
+                if not controls:
+                    return
+                try:
+                    self._picam.set_controls(controls)
+                    log.info("picamera controls applied: %s", controls)
+                except Exception as exc:
+                    log.warning("failed to apply picamera controls: %s", exc)
+                return
+            cap = self._cap
+            cv2 = self._cv2
+            if cap is None or cv2 is None:
+                log.warning("apply_controls: no V4L2 capture open — nothing to tune")
+                return
+
+            # V4L2 path: probe real driver ranges once, cache on the instance.
+            # OpenCV has no portable range query for CAP_PROP_*; the reliable
+            # source is `v4l2-ctl -l`. If that's unavailable, fall back to
+            # the known Centerm ranges (still far better than raw passthrough).
+            if getattr(self, "_ctrl_ranges", None) is None:
+                self._ctrl_ranges = self._probe_v4l2_ranges() or {}
+                # If the probe failed, assume UVC 0..200 (harmless no-op scale).
+                self._ctrl_ranges.setdefault(
+                    int(cv2.CAP_PROP_BRIGHTNESS), (-255.0, 255.0, 0.0))
+                self._ctrl_ranges.setdefault(
+                    int(cv2.CAP_PROP_CONTRAST), (0.0, 30.0, 16.0))
+            ranges = self._ctrl_ranges
+
+            try:
+                if brightness is not None:
+                    bmin, bmax, bdef = ranges[int(cv2.CAP_PROP_BRIGHTNESS)]
+                    mapped = map_to_driver(clamp(brightness), bmin, bmax, bdef)
+                    cap.set(cv2.CAP_PROP_BRIGHTNESS, mapped)
+                if contrast is not None:
+                    cmin, cmax, cdef = ranges[int(cv2.CAP_PROP_CONTRAST)]
+                    mapped = map_to_driver(clamp(contrast), cmin, cmax, cdef)
+                    cap.set(cv2.CAP_PROP_CONTRAST, mapped)
+                log.info(
+                    "v4l2 controls applied: brightness=%r contrast=%r (driver ranges %s)",
+                    brightness, contrast, ranges,
+                )
+            except Exception as exc:
+                log.warning("failed to apply v4l2 controls: %s", exc)
+
+    def _probe_v4l2_ranges(self) -> Optional[dict[int, tuple[float, float, float]]]:
+        """Parse `v4l2-ctl -l` for brightness/contrast min/max/default.
+
+        Returns {cv2_prop_id: (min, max, default)} or None if v4l2-ctl is
+        unavailable. Keys use cv2.CAP_PROP_* numeric ids so the caller can
+        index with the same constants used for cap.set().
+        """
+        import re
+        import subprocess
+
+        if self._cv2 is None or not getattr(self, "_device", None):
+            return None
+        dev = self._device
+        try:
+            out = subprocess.run(
+                ["v4l2-ctl", "-d", dev, "-l"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception as exc:
+            log.warning("v4l2-ctl probe failed: %s", exc)
+            return None
+
+        cv2 = self._cv2
+        result: dict[int, tuple[float, float, float]] = {}
+        # e.g. "brightness 0x00980900 (int) : min=-255 max=255 step=1 default=0 value=0"
+        pat = re.compile(
+            r"(brightness|contrast)\s+0x[0-9a-f]+\s+\(int\)\s*:\s*"
+            r"min=(-?\d+)\s+max=(-?\d+)\s+step=\d+\s+default=(-?\d+)"
+        )
+        for m in pat.finditer(out):
+            name, dmin, dmax, ddef = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            prop = cv2.CAP_PROP_BRIGHTNESS if name == "brightness" else cv2.CAP_PROP_CONTRAST
+            result[int(prop)] = (float(dmin), float(dmax), float(ddef))
+        return result or None
+
+    def preview_jpeg(self, max_width: int = 480) -> Optional[bytes]:
+        """Grab one frame and return it as scaled-down JPEG bytes.
+
+        Safe to call concurrently with the render loop — the lock
+        serializes the grab with read()/apply_controls(). Returns None
+        when no frame could be captured (camera missing, etc.).
+        """
+        if Image is None:
+            return None
+        try:
+            with self._lock:
+                frame = self._read_locked()
+                if frame is None:
+                    return None
+                if frame.width > max_width:
+                    scale = max_width / frame.width
+                    frame = frame.resize((max_width, max(1, round(frame.height * scale))))
+                buf = io.BytesIO()
+                frame.save(buf, format="JPEG", quality=70)
+                return buf.getvalue()
+        except Exception as exc:
+            log.warning("preview_jpeg failed: %s", exc)
+            return None
 
     def close(self) -> None:
         if self._picam is not None:
@@ -488,6 +639,7 @@ class FFmpegStreamer:
         output_height: Optional[int] = None,
         audio_device: Optional[str] = None,
         audio_bitrate: str = "128k",
+        audio_gain_db: Optional[int] = None,  # None → 10 dB (historic default)
         audio_sample_rate: int = 44100,
         audio_channels: int = 2,
         test_pattern: bool = False,  # noqa: ARG002 — kept for caller compat
@@ -753,19 +905,22 @@ class FFmpegStreamer:
             # AAC ADTS into the FIFO. Format pins must match arecord's
             # output exactly (-f s16le, same rate/channels).
             #
-            # 2026-10-04: +10dB digital gain (volume filter) — the camera
-            # mic (plughw:2,0) captures room tone at ~-37 dBFS RMS, which
-            # is audible but quiet for field use. The mic itself has no
-            # ALSA gain control, so we boost in the encode chain. Peaks
-            # were ~-26 dBFS pre-boost, so +10dB keeps ~4dB of headroom
-            # before clipping.
+            # Digital gain (volume filter): the camera mic (plughw:2,0)
+            # captures room tone at ~-37 dBFS RMS, which is audible but
+            # quiet for field use. The mic itself has no ALSA gain
+            # control, so we boost in the encode chain. Peaks were
+            # ~-26 dBFS pre-boost, so the default +10dB keeps ~4dB of
+            # headroom before clipping. The value is operator-tunable
+            # from Settings → Audio & Image (-10..30 dB, default 10)
+            # and applied on each stream start.
+            gain_db = 10 if audio_gain_db is None else int(audio_gain_db)
             audio_cmd = [
                 "ffmpeg", "-y", "-loglevel", "warning",
                 "-f", "s16le",
                 "-ar", str(audio_sample_rate),
                 "-ac", str(audio_channels),
                 "-i", "-",
-                "-af", "volume=10dB",
+                "-af", f"volume={gain_db}dB",
                 "-c:a", "aac",
                 "-b:a", audio_bitrate,
                 "-ar", str(audio_sample_rate),
@@ -1687,6 +1842,20 @@ class StreamingService:
         self._streaming = False
         self._test_pattern = False
         self._lock = threading.Lock()
+        # ── Live camera tuning + preview state (A/V tuning feature) ──
+        # Last-applied image knobs (UVC 0..200, None = camera default).
+        # Stashed so a camera_tune arriving before the camera opens (or
+        # between streams) is remembered and re-applied on next start.
+        self._camera_brightness: Optional[int] = None
+        self._camera_contrast: Optional[int] = None
+        # Preview emitter: while _preview_enabled, a background thread
+        # grabs ~1fps JPEGs and hands them to the _on_preview callback
+        # (wired to command_listener in main()). _last_preview_jpeg
+        # feeds the Flask GET /camera/preview.jpg debugging route.
+        self._preview_enabled = False
+        self._preview_thread: Optional[threading.Thread] = None
+        self._on_preview = None  # Callable[[bytes], None]
+        self._last_preview_jpeg: Optional[bytes] = None
 
     def set_overlay(self, **kwargs) -> OverlayState:
         for key, value in kwargs.items():
@@ -1702,6 +1871,9 @@ class StreamingService:
         output_height: Optional[int] = None,
         fps: Optional[int] = None,
         audio_bitrate: Optional[str] = None,
+        audio_gain_db: Optional[int] = None,
+        camera_brightness: Optional[int] = None,
+        camera_contrast: Optional[int] = None,
     ) -> dict:
         """
         Optional encoding overrides come from the backend's stream:cmd
@@ -1716,6 +1888,12 @@ class StreamingService:
             (source / 480×360 / 320×240) — backend enforces.
           fps: None = use --fps CLI arg.
           audio_bitrate: None = use --audio-bitrate CLI arg.
+          audio_gain_db: None = use --audio-gain-db CLI arg (default
+            +10 dB). Feeds ffmpeg's -af volume= filter.
+          camera_brightness / camera_contrast: UVC percentage 0..200
+            (100 = neutral), None = leave the camera at its default.
+            Applied right after the camera opens so the operator's
+            persisted image settings carry into every stream.
         """
         with self._lock:
             # If we're already streaming and the operator clicked Start again
@@ -1778,6 +1956,17 @@ class StreamingService:
                     height=self._args.height,
                     fps=self._args.fps,
                 )
+                # Apply the operator's image settings to the freshly opened
+                # camera. Runtime kwargs (from the backend's Start cmd) win
+                # over the CLI-arg defaults; the resolved values are stashed
+                # so a later camera_tune that only sends one knob can reapply
+                # the other without a round-trip.
+                resolved_brightness = camera_brightness if camera_brightness is not None else getattr(self._args, "camera_brightness", None)
+                resolved_contrast = camera_contrast if camera_contrast is not None else getattr(self._args, "camera_contrast", None)
+                self._camera_brightness = resolved_brightness
+                self._camera_contrast = resolved_contrast
+                if resolved_brightness is not None or resolved_contrast is not None:
+                    self._camera.apply_controls(resolved_brightness, resolved_contrast)
             # Resolve audio device: explicit --no-audio wins, then
             # --audio-device, then auto-detect (first USB audio device).
             audio_device = self._resolve_audio_device()
@@ -1803,6 +1992,10 @@ class StreamingService:
                     fps=fps if fps is not None else self._args.fps,
                     audio_device=audio_device,
                     audio_bitrate=audio_bitrate if audio_bitrate is not None else self._args.audio_bitrate,
+                    # Digital gain for ffmpeg's -af volume= filter.
+                    # Runtime kwarg (Settings → Audio & Image) wins over
+                    # the --audio-gain-db CLI default.
+                    audio_gain_db=audio_gain_db if audio_gain_db is not None else getattr(self._args, "audio_gain_db", None),
                     audio_sample_rate=self._args.audio_sample_rate,
                     audio_channels=self._args.audio_channels,
                     test_pattern=test_pattern,
@@ -1845,6 +2038,136 @@ class StreamingService:
             self._camera.close()
             self._camera = None
         return {"streaming": False}
+
+    # ── Live camera tuning + preview (A/V tuning feature) ──────────────
+
+    def set_preview_callback(self, callback) -> None:
+        """Register the sink for preview frames.
+
+        Wired in main() to command_listener.emit_preview, which relays
+        the JPEG to the backend as a stream:preview socket event.
+        """
+        self._on_preview = callback
+
+    def camera_tune(
+        self,
+        brightness: Optional[int] = None,
+        contrast: Optional[int] = None,
+        preview: Optional[bool] = None,
+    ) -> dict:
+        """Apply camera image controls and/or toggle the preview emitter.
+
+        Called by the camera_tune stream:cmd (backend's /stream/camera-tune
+        route) — works LIVE while streaming (the CameraSource lock keeps
+        the control write safe against the render loop) and while idle
+        (values are stashed and re-applied on the next stream start).
+        """
+        if brightness is not None:
+            self._camera_brightness = brightness
+        if contrast is not None:
+            self._camera_contrast = contrast
+
+        if brightness is not None or contrast is not None:
+            with self._lock:
+                camera = self._camera
+            if camera is not None:
+                camera.apply_controls(self._camera_brightness, self._camera_contrast)
+            else:
+                # Idle (not streaming): V4L2 controls are device-global and
+                # persist in the driver, so applying them through a short-lived
+                # capture works AND sticks — the next stream (or idle preview)
+                # then renders with the operator's values already in effect.
+                temp: Optional[CameraSource] = None
+                try:
+                    temp = CameraSource(
+                        device=self._args.camera, width=640, height=480, fps=15
+                    )
+                    temp.apply_controls(self._camera_brightness, self._camera_contrast)
+                    log.info(
+                        "camera_tune: applied while idle via temp capture "
+                        "(brightness=%r contrast=%r)",
+                        self._camera_brightness, self._camera_contrast,
+                    )
+                except Exception as exc:
+                    log.warning("camera_tune: idle apply failed: %s", exc)
+                finally:
+                    if temp is not None:
+                        try:
+                            temp.close()
+                        except Exception:
+                            pass
+
+        if preview is not None:
+            self._set_preview_enabled(preview)
+
+        return {
+            "brightness": self._camera_brightness,
+            "contrast": self._camera_contrast,
+            "preview": self._preview_enabled,
+        }
+
+    def last_preview_jpeg(self) -> Optional[bytes]:
+        """Most recent preview frame (for the Flask /camera/preview.jpg route)."""
+        return self._last_preview_jpeg
+
+    def _set_preview_enabled(self, enabled: bool) -> None:
+        self._preview_enabled = enabled
+        if enabled and (self._preview_thread is None or not self._preview_thread.is_alive()):
+            self._preview_thread = threading.Thread(
+                target=self._preview_loop, daemon=True, name="camera-preview"
+            )
+            self._preview_thread.start()
+            log.info("camera preview emitter started")
+        elif not enabled:
+            log.info("camera preview emitter disabled (loop will exit)")
+
+    def _preview_loop(self) -> None:
+        """Emit a preview JPEG roughly once per second while enabled."""
+        while self._preview_enabled:
+            jpeg = self._preview_frame()
+            if jpeg is not None:
+                self._last_preview_jpeg = jpeg
+                callback = self._on_preview
+                if callback is not None:
+                    try:
+                        callback(jpeg)
+                    except Exception as exc:
+                        log.warning("preview callback failed: %s", exc)
+            time.sleep(1.0)
+        log.info("camera preview emitter loop exited")
+
+    def _preview_frame(self) -> Optional[bytes]:
+        """Grab a preview JPEG from the live camera, or a temp capture when idle."""
+        with self._lock:
+            camera = self._camera
+        if camera is not None:
+            return camera.preview_jpeg()
+        # Idle (not streaming): open a temporary 640x480 capture just long
+        # enough to grab one frame, then close it. This is what makes the
+        # preview work while no stream is running. CameraSource picks the
+        # same backend (Picamera2 or V4L2) the streamer itself would use.
+        temp: Optional[CameraSource] = None
+        try:
+            temp = CameraSource(
+                device=self._args.camera,
+                width=640,
+                height=480,
+                fps=15,
+            )
+            # Re-apply the operator's persisted image settings so the idle
+            # preview shows the same look the stream will have (V4L2 controls
+            # live in the driver, but another process could have reset them).
+            temp.apply_controls(self._camera_brightness, self._camera_contrast)
+            return temp.preview_jpeg()
+        except Exception as exc:
+            log.debug("idle preview capture failed: %s", exc)
+            return None
+        finally:
+            if temp is not None:
+                try:
+                    temp.close()
+                except Exception:
+                    pass
 
     def _resolve_audio_device(self) -> Optional[str]:
         """Determine which ALSA device (if any) to capture audio from.
@@ -1964,6 +2287,28 @@ def build_control_app(service: StreamingService) -> "Flask":
             service._args.rtmp_url = url
         return jsonify({"rtmp_url": service._args.rtmp_url})
 
+    @app.post("/camera/tune")
+    def camera_tune():
+        payload = request.get_json(silent=True) or {}
+        return jsonify(service.camera_tune(
+            brightness=payload.get("brightness"),
+            contrast=payload.get("contrast"),
+            preview=payload.get("preview"),
+        ))
+
+    @app.get("/camera/preview.jpg")
+    def camera_preview():
+        """Latest preview frame — local debugging convenience.
+
+        The operator-facing preview flows through the socket relay
+        (stream:preview events); this endpoint is for curl / browser
+        checks directly against the Pi's control API.
+        """
+        jpeg = service.last_preview_jpeg()
+        if jpeg is None:
+            return jsonify({"error": "no preview frame yet"}), 503
+        return app.response_class(jpeg, mimetype="image/jpeg")
+
     return app
 
 
@@ -2041,6 +2386,28 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(1, 2),
         help="Audio channels: 1=mono, 2=stereo. Default: 2.",
     )
+    p.add_argument(
+        "--audio-gain-db",
+        type=int,
+        default=10,
+        help="Digital audio gain in dB for ffmpeg's volume filter (-10..30). "
+             "Default: 10 (matches the historic hardcoded +10dB boost). "
+             "Overridable per-start from Settings → Audio & Image.",
+    )
+    p.add_argument(
+        "--camera-brightness",
+        type=int,
+        default=None,
+        help="UVC camera brightness, 0..200 with 100 = neutral. "
+             "Default: camera default (no override).",
+    )
+    p.add_argument(
+        "--camera-contrast",
+        type=int,
+        default=None,
+        help="UVC camera contrast, 0..200 with 100 = neutral. "
+             "Default: camera default (no override).",
+    )
 
     p.add_argument("--api-port", type=int, default=DEFAULT_API_PORT,
                    help=f"Port for the control HTTP API (default: {DEFAULT_API_PORT})")
@@ -2088,6 +2455,9 @@ def main() -> None:
               output_height (int | None)
               fps (int)
               audio_bitrate (str, e.g. "64k")
+              audio_gain_db (int, -10..30)          — A/V tuning (2026)
+              camera_brightness (int | None, 0..200)
+              camera_contrast (int | None, 0..200)
 
             The service.start_streaming method applies these to the
             FFmpegStreamer it spawns for this stream. Each new Start
@@ -2105,6 +2475,19 @@ def main() -> None:
 
         def _on_stream_stop() -> None:
             service.stop_streaming()
+
+        def _on_camera_tune(
+            brightness: Optional[int] = None,
+            contrast: Optional[int] = None,
+            preview: Optional[bool] = None,
+        ) -> None:
+            """Live camera tuning from the backend's camera_tune cmd.
+
+            Applies image controls to the open camera (or stashes them
+            for the next start when idle) and toggles the preview
+            emitter — no stream restart needed.
+            """
+            service.camera_tune(brightness=brightness, contrast=contrast, preview=preview)
 
         def _on_state(payload: dict) -> None:
             """Receive state:update events from the backend in real time.
@@ -2128,7 +2511,17 @@ def main() -> None:
             on_start=_on_stream_start,
             on_stop=_on_stream_stop,
             on_state=_on_state,
+            on_camera_tune=_on_camera_tune,
         )
+
+        # Preview frames: the service's preview emitter hands JPEG bytes
+        # back through this callback, and the listener relays them to the
+        # backend as stream:preview socket events (throttled to ≥1s).
+        def _on_preview(jpeg_bytes: bytes) -> None:
+            if command_listener is not None:
+                command_listener.emit_preview(jpeg_bytes)
+
+        service.set_preview_callback(_on_preview)
         # Hook the poller to socket connection state changes — when the
         # socket drops we poll fast as a fallback; when it reconnects we
         # slow polling back down.

@@ -6,7 +6,9 @@
  *   PUT   /api/scoreboards/:id/stream/twitch/key     — save Twitch stream key + channel name
  *   PUT   /api/scoreboards/:id/stream/platform       — switch active destination (youtube | twitch)
  *   PUT   /api/scoreboards/:id/stream/test-pattern   — toggle test-pattern (Pi pushes testsrc2)
- *   PUT   /api/scoreboards/:id/stream/encoding       — set Pi encoder settings (resolution/fps/audio)
+ *   PUT   /api/scoreboards/:id/stream/encoding       — set Pi encoder settings (resolution/fps/audio + A/V tuning)
+ *   POST  /api/scoreboards/:id/stream/camera-tune    — live camera brightness/contrast + preview toggle (no restart)
+ *   POST  /api/scoreboards/:id/stream/preview        — toggle live camera preview frames (thin wrapper over camera-tune)
  *   POST  /api/scoreboards/:id/stream/start          — emit stream:cmd to Pi to begin streaming
  *   POST  /api/scoreboards/:id/stream/stop           — emit stream:cmd to Pi to stop streaming
  *
@@ -74,6 +76,11 @@ interface StreamRow {
   stream_output_height: number | null;
   stream_fps: number;
   stream_audio_bitrate: string;
+  // A/V tuning settings — see migration 004. Same projection rule:
+  // buildStatusResponse mirrors them in the encoding field.
+  stream_audio_gain_db: number;
+  stream_camera_brightness: number | null;
+  stream_camera_contrast: number | null;
 }
 
 /**
@@ -124,6 +131,12 @@ function buildStatusResponse(row: StreamRow, isConnected: boolean) {
       outputHeight: row.stream_output_height,
       fps: row.stream_fps,
       audioBitrate: row.stream_audio_bitrate,
+      // A/V tuning knobs (migration 004). Volume applies on the next
+      // Start (ffmpeg flag); brightness/contrast also go live via
+      // the camera-tune route below.
+      audioGainDb: row.stream_audio_gain_db,
+      cameraBrightness: row.stream_camera_brightness,
+      cameraContrast: row.stream_camera_contrast,
     },
     isConnected,
     // Remote IP:port of the connected Pi socket (if any). Lets the operator
@@ -151,7 +164,7 @@ streamRouter.get('/:id/stream/status', async (req: Request, res: Response) => {
       `SELECT id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
               stream_enabled, stream_status, stream_last_error,
               stream_started_at, stream_rtmp_url, stream_test_pattern,
-              stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate
+              stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast
        FROM scoreboards WHERE id = $1`,
       [id]
     );
@@ -321,7 +334,7 @@ streamRouter.put('/:id/stream/twitch/key', async (req: Request, res: Response) =
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
                  stream_enabled, stream_status, stream_last_error,
                  stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate`,
+                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       params
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -384,7 +397,7 @@ streamRouter.put('/:id/stream/platform', async (req: Request, res: Response) => 
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
                  stream_enabled, stream_status, stream_last_error,
                  stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate`,
+                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       [newPlatform, id]
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -421,7 +434,7 @@ streamRouter.put('/:id/stream/test-pattern', async (req: Request, res: Response)
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
                  stream_enabled, stream_status, stream_last_error,
                  stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate`,
+                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       [enabled, id]
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -464,6 +477,9 @@ streamRouter.put('/:id/stream/encoding', async (req: Request, res: Response) => 
       outputHeight?: unknown;
       fps?: unknown;
       audioBitrate?: unknown;
+      audioGainDb?: unknown;
+      cameraBrightness?: unknown;
+      cameraContrast?: unknown;
     };
 
     // Build the SET clause dynamically so partial updates work.
@@ -534,13 +550,56 @@ streamRouter.put('/:id/stream/encoding', async (req: Request, res: Response) => 
       sets.push(`stream_audio_bitrate = $${params.length}`);
     }
 
+    // ── A/V tuning knobs (migration 004) ──────────────────────────────
+    // Audio gain: integer dB for ffmpeg's volume filter. Applied on the
+    // NEXT Start (can't retune a running ffmpeg), unlike the camera
+    // knobs which additionally go live via /stream/camera-tune.
+    if (body.audioGainDb !== undefined) {
+      if (
+        typeof body.audioGainDb !== 'number' ||
+        !Number.isInteger(body.audioGainDb) ||
+        body.audioGainDb < -10 ||
+        body.audioGainDb > 30
+      ) {
+        return res.status(400).json({
+          error: 'audioGainDb must be an integer between -10 and 30 (dB)',
+        });
+      }
+      params.push(body.audioGainDb);
+      sets.push(`stream_audio_gain_db = $${params.length}`);
+    }
+
+    // Camera brightness/contrast: UVC-style percentage 0..200 with
+    // 100 = neutral. null = "camera default" (clears the override).
+    const parseCameraVal = (v: unknown, name: string): number | null => {
+      if (v === null) return null;
+      if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 200) {
+        throw new Error(`${name} must be an integer between 0 and 200, or null`);
+      }
+      return v;
+    };
+    for (const [key, col] of [
+      ['cameraBrightness', 'stream_camera_brightness'],
+      ['cameraContrast', 'stream_camera_contrast'],
+    ] as const) {
+      const raw = body[key];
+      if (raw === undefined) continue;
+      try {
+        const v = parseCameraVal(raw, key);
+        params.push(v);
+        sets.push(`${col} = $${params.length}`);
+      } catch (e) {
+        return res.status(400).json({ error: (e as Error).message });
+      }
+    }
+
     // Empty body = no-op (don't write). Return the current state.
     if (sets.length === 0) {
       const cur = await queryOne<StreamRow>(
         `SELECT id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
                 stream_enabled, stream_status, stream_last_error,
                 stream_started_at, stream_rtmp_url, stream_test_pattern,
-                stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate
+                stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast
          FROM scoreboards WHERE id = $1`,
         [id]
       );
@@ -558,7 +617,7 @@ streamRouter.put('/:id/stream/encoding', async (req: Request, res: Response) => 
        RETURNING id, stream_key, stream_platform, twitch_stream_key, twitch_channel_name,
                  stream_enabled, stream_status, stream_last_error,
                  stream_started_at, stream_rtmp_url, stream_test_pattern,
-                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate`,
+                 stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast`,
       params
     );
     if (!row) return res.status(404).json({ error: 'Scoreboard not found' });
@@ -570,6 +629,150 @@ streamRouter.put('/:id/stream/encoding', async (req: Request, res: Response) => 
   } catch (err) {
     console.error('[stream] encoding update error:', err);
     res.status(500).json({ error: 'Failed to update encoding settings' });
+  }
+});
+
+/**
+ * POST live camera tuning. Body: { brightness?: number|null, contrast?:
+ * number|null, preview?: boolean }.
+ *
+ * Emits stream:cmd { action: 'camera_tune', brightness, contrast, preview }
+ * to the Pi so the operator can adjust the camera image (and toggle the
+ * live preview) WITHOUT restarting a running stream. Any brightness/
+ * contrast values provided are also persisted (same columns the encoding
+ * PUT writes), so the next Start Stream re-applies them.
+ *
+ * Preview frames come back asynchronously: the Pi emits stream:preview
+ * (JPEG base64) events which socket.ts relays to the scoreboard room.
+ */
+streamRouter.post('/:id/stream/camera-tune', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid scoreboard id' });
+    }
+
+    const body = (req.body ?? {}) as {
+      brightness?: unknown;
+      contrast?: unknown;
+      preview?: unknown;
+    };
+
+    // Validate + normalize the camera values (0..200 or null). Unlike
+    // the encoding PUT, "not sent" means "don't touch" here too, but
+    // explicit null (back to camera default) is allowed.
+    let brightness: number | null | undefined;
+    let contrast: number | null | undefined;
+    const parseVal = (v: unknown, name: string): number | null => {
+      if (v === null) return null;
+      if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 200) {
+        throw new Error(`${name} must be an integer between 0 and 200, or null`);
+      }
+      return v;
+    };
+    if (body.brightness !== undefined) {
+      try {
+        brightness = parseVal(body.brightness, 'brightness');
+      } catch (e) {
+        return res.status(400).json({ error: (e as Error).message });
+      }
+    }
+    if (body.contrast !== undefined) {
+      try {
+        contrast = parseVal(body.contrast, 'contrast');
+      } catch (e) {
+        return res.status(400).json({ error: (e as Error).message });
+      }
+    }
+    let preview: boolean | undefined;
+    if (body.preview !== undefined) {
+      if (typeof body.preview !== 'boolean') {
+        return res.status(400).json({ error: 'preview must be a boolean' });
+      }
+      preview = body.preview;
+    }
+
+    if (brightness === undefined && contrast === undefined && preview === undefined) {
+      return res.status(400).json({ error: 'Provide brightness, contrast, and/or preview' });
+    }
+
+    // Persist brightness/contrast when provided so the next Start
+    // Stream re-applies them (partial update, same as encoding PUT).
+    if (brightness !== undefined || contrast !== undefined) {
+      const sets: string[] = [];
+      const params: unknown[] = [];
+      if (brightness !== undefined) {
+        params.push(brightness);
+        sets.push(`stream_camera_brightness = $${params.length}`);
+      }
+      if (contrast !== undefined) {
+        params.push(contrast);
+        sets.push(`stream_camera_contrast = $${params.length}`);
+      }
+      params.push(id);
+      await queryOne(
+        `UPDATE scoreboards SET ${sets.join(', ')} WHERE id = $${params.length}`,
+        params
+      );
+    }
+
+    // Forward to the Pi. If no Pi is connected we still report success
+    // (the values persisted) but flag it — the live effect + preview
+    // will kick in on the next camera-tune once the Pi reconnects, and
+    // the values apply on next Start regardless.
+    const piSocket = getSocketForScoreboard(id);
+    const piConnected = !!piSocket;
+    if (piSocket) {
+      piSocket.emit('stream:cmd', {
+        action: 'camera_tune',
+        brightness,
+        contrast,
+        preview,
+      });
+    }
+
+    res.json({
+      success: true,
+      piConnected,
+      brightness: brightness ?? null,
+      contrast: contrast ?? null,
+      preview: preview ?? null,
+    });
+  } catch (err) {
+    console.error('[stream] camera-tune error:', err);
+    res.status(500).json({ error: 'Failed to tune camera' });
+  }
+});
+
+/**
+ * POST toggle the live camera preview. Body: { enabled: boolean }.
+ * Thin wrapper over camera-tune that only flips the preview flag —
+ * kept as its own endpoint so the frontend reads clearly and future
+ * preview-specific options (rate, size) have a home.
+ */
+streamRouter.post('/:id/stream/preview', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid scoreboard id' });
+    }
+    const { enabled } = (req.body ?? {}) as { enabled?: unknown };
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+    const piSocket = getSocketForScoreboard(id);
+    if (piSocket) {
+      piSocket.emit('stream:cmd', {
+        action: 'camera_tune',
+        brightness: undefined,
+        contrast: undefined,
+        preview: enabled,
+      });
+    }
+    res.json({ success: true, piConnected: !!piSocket, preview: enabled });
+  } catch (err) {
+    console.error('[stream] preview toggle error:', err);
+    res.status(500).json({ error: 'Failed to toggle preview' });
   }
 });
 
@@ -603,10 +806,15 @@ streamRouter.post('/:id/stream/start', async (req: Request, res: Response) => {
     stream_output_height: number | null;
     stream_fps: number;
     stream_audio_bitrate: string;
+    // A/V tuning settings (migration 004) — forwarded alongside the
+    // encoding kwargs so each Start picks up the latest values.
+    stream_audio_gain_db: number;
+    stream_camera_brightness: number | null;
+    stream_camera_contrast: number | null;
   }>(
     `SELECT youtube_channel_id, stream_platform, twitch_stream_key, twitch_channel_name,
             stream_status, stream_test_pattern,
-            stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate
+            stream_output_width, stream_output_height, stream_fps, stream_audio_bitrate, stream_audio_gain_db, stream_camera_brightness, stream_camera_contrast
      FROM scoreboards WHERE id = $1`,
     [id]
   );
@@ -722,6 +930,13 @@ streamRouter.post('/:id/stream/start', async (req: Request, res: Response) => {
       outputHeight: sb.stream_output_height,
       fps: sb.stream_fps,
       audioBitrate: sb.stream_audio_bitrate,
+      // A/V tuning (migration 004). audioGainDb feeds ffmpeg's -af
+      // volume filter; cameraBrightness/Contrast are applied to the
+      // UVC device right after camera open. NULL camera values mean
+      // "leave the camera at its default".
+      audioGainDb: sb.stream_audio_gain_db,
+      cameraBrightness: sb.stream_camera_brightness,
+      cameraContrast: sb.stream_camera_contrast,
     });
 
     res.json({

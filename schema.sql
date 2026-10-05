@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS scoreboards (
     stream_test_pattern BOOLEAN NOT NULL DEFAULT false,   -- when true, Pi pushes ffmpeg testsrc2 instead of camera
     direct_stream_ingest_url TEXT,                        -- RTMP URL the Pi pushes to in direct mode (e.g. rtmp://mac-mini:1935/live)
 
+    -- Stream A/V tuning (see migration 004)
+    stream_audio_gain_db     INTEGER NOT NULL DEFAULT 10, -- ffmpeg -af volume= gain in dB (-10..30)
+    stream_camera_brightness INTEGER,                      -- UVC 0..200, 100 = neutral; NULL = camera default
+    stream_camera_contrast   INTEGER,                      -- UVC 0..200, 100 = neutral; NULL = camera default
+
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

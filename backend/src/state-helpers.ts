@@ -56,6 +56,12 @@ export interface ScoreboardRow {
   stream_output_height: number | null;
   stream_fps: number;
   stream_audio_bitrate: string;
+  // A/V tuning knobs (see backend migration 004). Gain is ffmpeg
+  // volume-filter dB; brightness/contrast are UVC percentages
+  // (0..200, 100 neutral) with NULL = camera default.
+  stream_audio_gain_db: number;
+  stream_camera_brightness: number | null;
+  stream_camera_contrast: number | null;
   // Team whose GameChanger stream is being polled — the "home" team
   // for viewer-facing highlights. Mirrored from types.ScoreboardRow.
   gc_team_name: string | null;

@@ -326,6 +326,10 @@ export async function setStreamTestPattern(id: number, enabled: boolean): Promis
  * `outputWidth`/`outputHeight`: null = no scaling (use capture size).
  *   Backend enforces the (null, null) / (480, 360) / (320, 240) presets —
  *   sending arbitrary dimensions 400s.
+ *
+ * A/V tuning fields (migration 004): `audioGainDb` (−10..30 dB, applies
+ * on next Start), `cameraBrightness`/`cameraContrast` (0..200, 100 =
+ * neutral, null = camera default — also live-tunable via cameraTune).
  */
 export async function setStreamEncoding(
   id: number,
@@ -334,9 +338,39 @@ export async function setStreamEncoding(
     outputHeight?: number | null;
     fps?: number;
     audioBitrate?: string;
+    audioGainDb?: number;
+    cameraBrightness?: number | null;
+    cameraContrast?: number | null;
   }
 ): Promise<StreamStatusPayload> {
   const res = await client.put<StreamStatusPayload>(`/scoreboards/${id}/stream/encoding`, payload);
+  return res.data;
+}
+
+/**
+ * Live camera tuning — applies brightness/contrast to the Pi's camera
+ * WITHOUT restarting a running stream, and toggles the ~1fps preview
+ * emitter. Values provided are also persisted so the next Start re-applies
+ * them. Preview frames come back asynchronously via the socket
+ * `stream:preview` event (JPEG base64).
+ */
+export async function cameraTune(
+  id: number,
+  payload: { brightness?: number | null; contrast?: number | null; preview?: boolean }
+): Promise<{ success: boolean; piConnected: boolean }> {
+  const res = await client.post(`/scoreboards/${id}/stream/camera-tune`, payload);
+  return res.data;
+}
+
+/**
+ * Toggle the live camera preview on/off. Thin wrapper over cameraTune —
+ * only flips the preview flag.
+ */
+export async function setStreamPreview(
+  id: number,
+  enabled: boolean
+): Promise<{ success: boolean; piConnected: boolean }> {
+  const res = await client.post(`/scoreboards/${id}/stream/preview`, { enabled });
   return res.data;
 }
 

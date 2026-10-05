@@ -22,6 +22,7 @@ so the operator UI reflects what's actually happening on the Pi (e.g.
 ffmpeg crashed, camera missing, etc.).
 """
 
+import base64
 import logging
 import threading
 import time
@@ -63,6 +64,7 @@ class StreamCommandListener:
         on_start: Callable[..., None],
         on_stop: Callable[[], None],
         on_state: Optional[Callable[[dict], None]] = None,
+        on_camera_tune: Optional[Callable[..., None]] = None,
     ) -> None:
         """
         Args:
@@ -74,18 +76,26 @@ class StreamCommandListener:
                         - output_height (int | None): encoder output height; None = no scaling
                         - fps (int): capture + encode frame rate (15/24/30)
                         - audio_bitrate (str): AAC bitrate like "64k", "96k", "128k"
+                        - audio_gain_db (int): ffmpeg volume-filter gain, -10..30 dB
+                        - camera_brightness (int | None): UVC 0..200, 100 neutral
+                        - camera_contrast (int | None): UVC 0..200, 100 neutral
                       The Pi applies them on each new stream start — operator has
                       to Stop + Start to apply mid-session changes (ffmpeg can't
                       change resolution mid-stream).
                       test_pattern=True → push ffmpeg's testsrc2 filter (no camera)
             on_stop: callback() — called when we get a stop cmd
             on_state: callback(payload_dict) — called when we get a state:update
+            on_camera_tune: callback(brightness=None, contrast=None, preview=None)
+                      — called on stream:cmd {action:'camera_tune'} so the
+                      operator can adjust the camera image + preview LIVE
+                      (no stream restart needed).
         """
         self._backend_url = backend_url.rstrip("/")
         self._identifier = identifier
         self._on_start = on_start
         self._on_stop = on_stop
         self._on_state = on_state
+        self._on_camera_tune = on_camera_tune
 
         # python-socketio client uses long-polling + websocket fallback, just
         # like the browser. Default reconnect logic is fine.
@@ -102,6 +112,10 @@ class StreamCommandListener:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        # stream:preview emit throttle — at most one frame per second.
+        # The service's preview loop already runs at ~1 fps; this stops
+        # a runaway emitter from flooding the socket.
+        self._last_preview_emit = 0.0
 
         self._register_handlers()
 
@@ -201,8 +215,13 @@ class StreamCommandListener:
                 # accepts these and uses them when it spawns ffmpeg. Any
                 # field that comes through as None/0 is ignored (the
                 # streamer falls back to its CLI-arg defaults).
+                # A/V tuning fields (audioGainDb / cameraBrightness /
+                # cameraContrast) ride the same path (2026).
                 encoding_kwargs = {}
-                for kw in ("outputWidth", "outputHeight", "fps", "audioBitrate"):
+                for kw in (
+                    "outputWidth", "outputHeight", "fps", "audioBitrate",
+                    "audioGainDb", "cameraBrightness", "cameraContrast",
+                ):
                     if kw in data:
                         encoding_kwargs[_to_snake(kw)] = data[kw]
                 log.info(
@@ -224,6 +243,29 @@ class StreamCommandListener:
                 except Exception as exc:
                     log.exception("on_stop callback failed")
                     self.emit_status("error", f"stop failed: {exc}")
+            elif action == "camera_tune":
+                # Live camera tuning (A/V tuning feature): brightness /
+                # contrast apply to the open camera immediately (works
+                # while streaming AND while idle); preview toggles the
+                # ~1fps JPEG emitter. No stream restart needed.
+                brightness = data.get("brightness")
+                contrast = data.get("contrast")
+                preview = data.get("preview")
+                log.info(
+                    "received camera_tune cmd — brightness=%r contrast=%r preview=%r",
+                    brightness, contrast, preview,
+                )
+                if self._on_camera_tune is None:
+                    log.warning("camera_tune cmd received but no callback wired")
+                    return
+                try:
+                    self._on_camera_tune(
+                        brightness=brightness,
+                        contrast=contrast,
+                        preview=preview,
+                    )
+                except Exception as exc:
+                    log.exception("on_camera_tune callback failed")
             elif action == "reset":
                 log.warning("received reset cmd — hard-stopping stream pipeline")
                 try:
@@ -254,6 +296,28 @@ class StreamCommandListener:
             self._sio.emit("stream:status", payload)
         except Exception as exc:
             log.warning("failed to emit stream:status: %s", exc)
+
+    def emit_preview(self, jpeg_bytes: bytes) -> None:
+        """Forward a camera preview frame to the backend as stream:preview.
+
+        Payload: { jpeg: <base64 JPEG> }. The backend relays it to the
+        scoreboard's socket room so the Settings preview pane can render
+        it. Throttled to at most one emit per second and dropped entirely
+        when the socket is disconnected.
+        """
+        if not self._sio.connected:
+            return
+        now = time.monotonic()
+        if now - self._last_preview_emit < 1.0:
+            return
+        self._last_preview_emit = now
+        try:
+            self._sio.emit(
+                "stream:preview",
+                {"jpeg": base64.b64encode(jpeg_bytes).decode("ascii")},
+            )
+        except Exception as exc:
+            log.warning("failed to emit stream:preview: %s", exc)
 
     def start(self) -> None:
         if self._running:

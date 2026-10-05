@@ -14,11 +14,16 @@
  * of the platform and persists to DB so the backend reads the same value on
  * every Start call.
  *
+ * The "Audio & Image" section adds A/V tuning: a volume (gain dB) slider
+ * saved with the encoding settings, brightness/contrast sliders that tune
+ * the Pi's camera LIVE via /stream/camera-tune, and a live camera preview
+ * fed by socket `stream:preview` events (JPEG base64 relayed by the backend).
+ *
  * URL params handled:
  *   ?youtube=connected  — shown as a success banner after OAuth callback
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   streamStatus,
   youtubeDisconnect,
@@ -26,6 +31,8 @@ import {
   setStreamTestPattern,
   setStreamPlatform,
   setStreamEncoding,
+  cameraTune,
+  setStreamPreview,
   updateTwitchStreamKey,
   type StreamStatusPayload,
 } from '../api.js';
@@ -85,6 +92,26 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
   const [encodingFpsDraft, setEncodingFpsDraft] = useState<number>(30);
   const [encodingAudioDraft, setEncodingAudioDraft] = useState<string>('64k');
   const [savingEncoding, setSavingEncoding] = useState(false);
+  // ── A/V tuning drafts (Audio & Image section) ─────────────────────
+  // Volume is ffmpeg-side gain (dB); saved via the encoding PUT and
+  // applied on the next Start Stream. Brightness/contrast are UVC
+  // percentages (0..200, 100 = neutral) that ALSO tune the camera LIVE
+  // (debounced POST /stream/camera-tune) while being drafted.
+  const [audioGainDraft, setAudioGainDraft] = useState<number>(10);
+  const [cameraBrightnessDraft, setCameraBrightnessDraft] = useState<number>(100);
+  const [cameraContrastDraft, setCameraContrastDraft] = useState<number>(100);
+  const [savingAV, setSavingAV] = useState(false);
+  // Seeded-once guard so the 5s status poll doesn't fight the operator
+  // mid-drag (same pattern as twitchLoginDraft).
+  const avSeededRef = useRef(false);
+  // Last values we pushed to the Pi live — the debounce effect compares
+  // against this to avoid re-POSTing on every poll re-render.
+  const lastTunedRef = useRef<{ b: number; c: number } | null>(null);
+  // ── Live camera preview ───────────────────────────────────────────
+  // previewOn toggles the Pi's ~1fps JPEG emitter; frames arrive via the
+  // socket `stream:preview` event (JPEG base64) relayed by the backend.
+  const [previewOn, setPreviewOn] = useState(false);
+  const [previewJpeg, setPreviewJpeg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
@@ -127,6 +154,18 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
         setEncodingOutputPreset(presetKey);
         setEncodingFpsDraft(enc.fps);
         setEncodingAudioDraft(enc.audioBitrate);
+        // Seed the Audio & Image drafts once (null camera values map to
+        // the 100 "neutral" slider position). Guarded so later polls
+        // don't clobber in-flight slider drags.
+        if (!avSeededRef.current) {
+          avSeededRef.current = true;
+          const b = enc.cameraBrightness ?? 100;
+          const c = enc.cameraContrast ?? 100;
+          setAudioGainDraft(enc.audioGainDb ?? 10);
+          setCameraBrightnessDraft(b);
+          setCameraContrastDraft(c);
+          lastTunedRef.current = { b, c };
+        }
       }
       // Seed Twitch login input from the DB value (read-only — not
       // the key itself, just the login). The draft is only initialised
@@ -148,6 +187,57 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
     const t = setInterval(refresh, 5_000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // ── Live camera tuning (debounced) ──────────────────────────────────
+  // Brightness/contrast slider drags POST /stream/camera-tune ~400ms after
+  // the operator stops moving, so the effect on the camera (and preview)
+  // is live without hammering the socket. Skipped until the drafts are
+  // seeded and skipped when the values match what we last sent.
+  useEffect(() => {
+    const last = lastTunedRef.current;
+    if (!last) return; // drafts not seeded yet
+    if (cameraBrightnessDraft === last.b && cameraContrastDraft === last.c) return;
+    const t = setTimeout(() => {
+      cameraTune(scoreboardId, {
+        brightness: cameraBrightnessDraft,
+        contrast: cameraContrastDraft,
+      })
+        .then(() => {
+          lastTunedRef.current = { b: cameraBrightnessDraft, c: cameraContrastDraft };
+        })
+        .catch(() => {
+          // Non-fatal: live tuning is best-effort (Pi may be offline).
+          // The values still persist via the Save button.
+        });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [cameraBrightnessDraft, cameraContrastDraft, scoreboardId]);
+
+  // ── Camera preview: socket subscription + Pi emitter toggle ─────────
+  // While previewOn: tell the Pi to start emitting frames and listen for
+  // the backend-relayed stream:preview events. On off/unmount: stop the
+  // emitter and unsubscribe. The socket instance is the app-wide one
+  // created by useScoreboardSocket and exposed on window.__io (same
+  // pattern as StreamPanel's stream:status listener).
+  useEffect(() => {
+    if (!previewOn) return;
+    cameraTune(scoreboardId, { preview: true }).catch(() => {
+      // Pi may be offline — the "waiting for frames…" state covers it.
+    });
+    const io = (window as unknown as { __io?: { on: Function; off: Function } }).__io;
+    const handler = (p: { scoreboardId?: number; jpeg?: string }) => {
+      if (!p || typeof p.jpeg !== 'string' || p.jpeg.length === 0) return;
+      if (typeof p.scoreboardId === 'number' && p.scoreboardId !== scoreboardId) return;
+      setPreviewJpeg(p.jpeg);
+    };
+    if (io) io.on('stream:preview', handler);
+    return () => {
+      if (io) io.off('stream:preview', handler);
+      setStreamPreview(scoreboardId, false).catch(() => {
+        // Best-effort — the Pi also stops if the socket drops.
+      });
+    };
+  }, [previewOn, scoreboardId]);
 
   // ── Handlers ──────────────────────────────────────────────────────────
 
@@ -347,6 +437,39 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
     } finally {
       setSavingEncoding(false);
     }
+  };
+
+  // Persist the Audio & Image drafts (volume + camera knobs) via the
+  // encoding PUT. Volume only takes effect on the next Start Stream —
+  // helper text in the section says so. Brightness/contrast were already
+  // applied live by the debounced camera-tune POST; saving persists them
+  // so future streams re-apply them.
+  const handleSaveAV = async () => {
+    setError(null);
+    setInfo(null);
+    setSavingAV(true);
+    try {
+      const updated = await setStreamEncoding(scoreboardId, {
+        audioGainDb: audioGainDraft,
+        cameraBrightness: cameraBrightnessDraft,
+        cameraContrast: cameraContrastDraft,
+      });
+      setStream(updated);
+      setInfo('Audio & image settings saved. Volume applies on the next Start Stream.');
+    } catch (e) {
+      const ax = e as { response?: { data?: { error?: string } } };
+      setError(ax?.response?.data?.error || 'Failed to save audio & image settings');
+    } finally {
+      setSavingAV(false);
+    }
+  };
+
+  // Toggle the live camera preview. The emitter on/off POST and the
+  // socket (un)subscription live in the previewOn effect above; here we
+  // just flip state and clear any stale frame.
+  const handlePreviewToggle = () => {
+    setPreviewOn((on) => !on);
+    setPreviewJpeg(null);
   };
 
   if (!stream || !yt) {
@@ -571,6 +694,164 @@ export default function StreamSettings({ scoreboardId, scoreboard }: Props) {
             data-testid="encoding-save"
           >
             {savingEncoding ? 'Saving…' : 'Save Encoding Settings'}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Audio & Image (platform-agnostic, live tuning) ──────────── */}
+      <div
+        className="av-tuning-section"
+        style={{
+          margin: '1rem 0',
+          padding: '0.75rem',
+          background: 'var(--bg-alt, rgba(255,255,255,0.03))',
+          border: '1px solid var(--border, #333)',
+          borderRadius: 8,
+        }}
+        data-testid="av-tuning-section"
+      >
+        <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>Audio &amp; Image</div>
+        <p className="muted small" style={{ marginBottom: '0.75rem' }}>
+          Volume is applied by the Pi's audio encoder; brightness and contrast
+          are applied directly on the camera. Image adjustments (and the
+          preview) work <em>live</em> — while streaming or idle — no restart
+          needed. Volume applies to the <em>next</em> Start Stream.
+          {!stream.isConnected && (
+            <> The Pi is currently offline — sliders will save but won't take effect until it reconnects.</>
+          )}
+        </p>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+            gap: '0.75rem',
+          }}
+        >
+          <label style={{ display: 'block' }}>
+            <div className="muted small" style={{ marginBottom: '0.25rem' }}>
+              Volume (audio gain): <strong>{audioGainDraft > 0 ? `+${audioGainDraft}` : audioGainDraft} dB</strong>
+            </div>
+            <input
+              type="range"
+              min={-10}
+              max={30}
+              step={1}
+              value={audioGainDraft}
+              onChange={(e) => setAudioGainDraft(parseInt(e.target.value, 10))}
+              disabled={savingAV}
+              data-testid="av-gain-slider"
+              style={{ width: '100%' }}
+            />
+            <div className="muted small" style={{ marginTop: '0.25rem' }}>
+              Digital gain for the stream's mic. 0 dB = source level. Saved on
+              Save — applies to the next Start Stream (a running stream keeps
+              its current volume).
+            </div>
+          </label>
+
+          <label style={{ display: 'block' }}>
+            <div className="muted small" style={{ marginBottom: '0.25rem' }}>
+              Brightness: <strong>{cameraBrightnessDraft}</strong>
+              {cameraBrightnessDraft !== 100 && <span className="muted"> ({cameraBrightnessDraft > 100 ? '+' : ''}{cameraBrightnessDraft - 100})</span>}
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={200}
+              step={1}
+              value={cameraBrightnessDraft}
+              onChange={(e) => setCameraBrightnessDraft(parseInt(e.target.value, 10))}
+              disabled={savingAV}
+              data-testid="av-brightness-slider"
+              style={{ width: '100%' }}
+            />
+          </label>
+
+          <label style={{ display: 'block' }}>
+            <div className="muted small" style={{ marginBottom: '0.25rem' }}>
+              Contrast: <strong>{cameraContrastDraft}</strong>
+              {cameraContrastDraft !== 100 && <span className="muted"> ({cameraContrastDraft > 100 ? '+' : ''}{cameraContrastDraft - 100})</span>}
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={200}
+              step={1}
+              value={cameraContrastDraft}
+              onChange={(e) => setCameraContrastDraft(parseInt(e.target.value, 10))}
+              disabled={savingAV}
+              data-testid="av-contrast-slider"
+              style={{ width: '100%' }}
+            />
+          </label>
+        </div>
+
+        <div className="muted small" style={{ marginTop: '0.5rem' }}>
+          100 = neutral for the image sliders. Changes are pushed to the camera
+          live (about half a second after you stop dragging) and also saved
+          when you click Save below.
+        </div>
+
+        {/* ── Live preview pane ───────────────────────────────────────── */}
+        <div
+          style={{
+            marginTop: '0.75rem',
+            padding: '0.5rem',
+            border: `1px solid ${previewOn ? 'var(--accent, #6366f1)' : 'var(--border, #333)'}`,
+            borderRadius: 6,
+          }}
+          data-testid="av-preview-pane"
+        >
+          <div className="stream-buttons" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+            <button
+              type="button"
+              className={previewOn ? 'btn btn-ghost' : 'btn btn-primary'}
+              onClick={handlePreviewToggle}
+              data-testid="av-preview-toggle"
+            >
+              {previewOn ? 'Hide camera preview' : 'Show camera preview'}
+            </button>
+            {previewOn && (
+              <span className="muted small">
+                {previewJpeg ? 'live · ~1 fps' : 'waiting for frames…'}
+              </span>
+            )}
+          </div>
+          {previewOn && (
+            <div style={{ marginTop: '0.5rem' }}>
+              {previewJpeg ? (
+                <img
+                  src={`data:image/jpeg;base64,${previewJpeg}`}
+                  alt="Live camera preview"
+                  data-testid="av-preview-img"
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    maxWidth: 480,
+                    borderRadius: 4,
+                    border: '1px solid var(--border, #333)',
+                  }}
+                />
+              ) : (
+                <p className="muted small" style={{ margin: 0 }}>
+                  waiting for frames… (the Pi sends one frame per second; if
+                  this never resolves, check that the Pi is online)
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="stream-buttons" style={{ marginTop: '0.75rem' }}>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={handleSaveAV}
+            disabled={savingAV}
+            data-testid="av-save"
+          >
+            {savingAV ? 'Saving…' : 'Save Audio & Image'}
           </button>
         </div>
       </div>

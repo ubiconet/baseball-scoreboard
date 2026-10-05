@@ -80,6 +80,12 @@ export interface StreamStatusPayload {
     outputHeight: number | null;
     fps: number;
     audioBitrate: string;
+    // A/V tuning knobs (backend migration 004). Optional because legacy
+    // backends don't send them. cameraBrightness/Contrast: UVC 0..200
+    // with 100 = neutral; null = camera default.
+    audioGainDb?: number;
+    cameraBrightness?: number | null;
+    cameraContrast?: number | null;
   };
 }
 

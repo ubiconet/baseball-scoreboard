@@ -9,6 +9,8 @@
  * - stream:cmd / stream:status: control channel for the Pi streamer
  *   (Pi subscribes like a normal socket client, browser commands target it
  *    by scoreboard room)
+ * - stream:preview: Pi → browser JPEG relay for the live camera preview
+ *   (size + rate guarded, re-emitted to the scoreboard room)
  */
 
 import type { Server as SocketIOServer, Socket } from 'socket.io';
@@ -36,6 +38,14 @@ interface SocketMetadata {
   remoteAddress?: string; // <ip>:<port> for Pi sockets — used to surface "which Pi is connected" in the operator UI so the operator can SSH without scanning the LAN.
 }
 const socketToScoreboard = new Map<string, SocketMetadata>();
+
+// ── Camera preview relay guards ─────────────────────────────────────────
+// stream:preview frames come from the Pi roughly once per second while the
+// operator has the preview pane open. Cap the payload size and the relay
+// rate so a buggy/compromised emitter can't flood the scoreboard room.
+const PREVIEW_MAX_BYTES = 200 * 1024; // 200KB decoded JPEG
+const PREVIEW_MIN_INTERVAL_MS = 500; // min spacing between relayed frames
+const previewLastEmit = new Map<number, number>(); // scoreboardId → last emit ts
 
 /**
  * Return the remote IP:port of the most-recently-connected Pi socket for
@@ -301,6 +311,48 @@ export function initSocketServer(io: SocketIOServer): void {
         streamKeyMasked: undefined,
         streamEnabled: true,
       });
+    });
+
+    // ── Pi → Backend: camera preview frame ────────────────
+    // The Pi emits these while its preview flag is on (see the
+    // /stream/camera-tune route): { jpeg: <base64 JPEG> } roughly once
+    // per second. We re-emit to the scoreboard room so browsers
+    // subscribed to this scoreboard can render the live preview in
+    // Settings → Audio & Image. Guards:
+    //   - only Pi-role sockets may relay (a browser spoofing frames
+    //     would otherwise broadcast to every spectator in the room)
+    //   - decoded payload must stay under 200KB
+    //   - at most one frame per 500ms per scoreboard (the Pi already
+    //     throttles to ~1/s; this protects against a runaway emitter)
+    socket.on('stream:preview', (data: unknown) => {
+      const meta = socketToScoreboard.get(socket.id);
+      if (!meta || meta.role !== 'pi') {
+        return;
+      }
+      const msg = data as { jpeg?: unknown };
+      if (typeof msg?.jpeg !== 'string' || msg.jpeg.length === 0) return;
+
+      // Size guard — decode to measure real bytes (base64 inflates ~4/3).
+      const jpegBytes = Buffer.from(msg.jpeg, 'base64');
+      if (jpegBytes.length === 0 || jpegBytes.length > PREVIEW_MAX_BYTES) {
+        console.warn(
+          `[socket] stream:preview dropped for scoreboard ${meta.scoreboardId}: ` +
+            `${jpegBytes.length} bytes exceeds ${PREVIEW_MAX_BYTES}`
+        );
+        return;
+      }
+
+      // Rate guard per scoreboard.
+      const now = Date.now();
+      const last = previewLastEmit.get(meta.scoreboardId) ?? 0;
+      if (now - last < PREVIEW_MIN_INTERVAL_MS) return;
+      previewLastEmit.set(meta.scoreboardId, now);
+
+      if (ioInstance) {
+        ioInstance
+          .to(scoreboardRoom(meta.scoreboardId))
+          .emit('stream:preview', { scoreboardId: meta.scoreboardId, jpeg: msg.jpeg });
+      }
     });
 
     socket.on('disconnect', (reason: string) => {
